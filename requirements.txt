@@ -1,0 +1,4 @@
+customtkinter
+pyserial
+pillow
+python-docx
