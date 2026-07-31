@@ -3,6 +3,8 @@ import os
 import subprocess
 import sys
 import time
+import threading
+from collections import deque
 import customtkinter as ctk
 from tkinter import ttk, filedialog, messagebox
 from .components import (
@@ -74,12 +76,18 @@ class SerialApp(ctk.CTk):
         self.library_visible = False
         self.send_visible = False
         self.auto_scroll = True
+        self.display_mode = "hex"
         self.hex_mode = True
         self.monitoring = False
+        self.monitor_stopping = False
+        self._closing = False
         self.selected_command_index = None
         # True=协议解析模式(绿底白字, 显示协议控件)
         # False=原始数据模式(白底黑字, 隐藏协议控件)
         self.parse_mode = True
+
+        # 保存最近接收的原始 bytes（HEX/ASCII 切换时重新渲染）
+        self.rx_history = deque(maxlen=2000)
 
         # 显示名称 -> 真实端口(COM 号)的映射
         # 下拉框显示 display_name，连接时通过它取出真实 device 传给 pyserial
@@ -119,7 +127,10 @@ class SerialApp(ctk.CTk):
     def _init_workers(self):
         try:
             from serial_core.serial_worker import SerialWorker
-            self.worker = SerialWorker(callback=self._on_serial_data)
+            self.worker = SerialWorker(
+                callback=self._on_serial_data,
+                error_callback=self._on_serial_error,
+            )
         except Exception:
             self.worker = None
 
@@ -309,10 +320,12 @@ class SerialApp(ctk.CTk):
         )
         self.collapse_button.grid(row=0, column=7, sticky="nse", padx=(8, 0))
 
-        Btn(
+        self.format_button = Btn(
             self.serial_config_header, "HEX 格式", color="green",
-            width=90, height=CONTROL_HEIGHT, command=self._toggle_hex,
-        ).grid(row=0, column=8, sticky="nse", padx=(8, 0))
+            width=90, height=CONTROL_HEIGHT,
+            command=self._toggle_display_format,
+        )
+        self.format_button.grid(row=0, column=8, sticky="nse", padx=(8, 0))
 
         # ── Body (rows 2-3, collapsible) ──
         self.serial_config_body = ctk.CTkFrame(self.serial_config_card, fg_color="transparent")
@@ -901,45 +914,293 @@ class SerialApp(ctk.CTk):
         self.update_idletasks()
 
     def _toggle_monitor(self):
-        if self.monitoring:
-            self.monitoring = False
-            self.monitor_btn.configure(text="开始监控 ▶", fg_color=BLUE, text_color="white")
-        else:
-            selected_display_name = self.com_port.get()
+        if self.monitor_stopping:
+            return
 
-            port = self.port_display_map.get(
-                selected_display_name,
-                ""
+        if self.monitoring:
+            self._stop_monitoring()
+        else:
+            self._start_monitoring()
+
+    def _start_monitoring(self):
+        selected_display = self.com_port.get()
+
+        port = self.port_display_map.get(
+            selected_display,
+            "",
+        )
+
+        if not port:
+            messagebox.showwarning(
+                "串口错误",
+                "请选择有效串口。",
+                parent=self,
+            )
+            return
+
+        try:
+            if hasattr(self.baud_cb, "get_valid_baud"):
+                baud = self.baud_cb.get_valid_baud()
+            else:
+                baud = int(self.baud_cb.get())
+
+            data_bits = int(self.data_bits_cb.get())
+            stop_bits = float(self.stop_bits_cb.get())
+
+        except (TypeError, ValueError) as error:
+            messagebox.showwarning(
+                "串口参数错误",
+                str(error),
+                parent=self,
+            )
+            return
+
+        # 连接期间临时禁用按钮
+        self.monitor_btn.configure(
+            state="disabled",
+            text="正在连接...",
+        )
+        self.update_idletasks()
+
+        try:
+            # connect/start 成功后才能把 monitoring 设置为 True
+            self.worker.connect(
+                port=port,
+                baudrate=baud,
+                data_bits=data_bits,
+                stop_bits=stop_bits,
             )
 
-            if not port:
-                messagebox.showwarning("提示", "未检测到可用串口")
-                return
+        except Exception as error:
+            self.monitoring = False
+
+            self.monitor_btn.configure(
+                text="开始监控 ▶",
+                fg_color=BLUE,
+                hover_color="#4096FF",
+                border_color=BLUE,
+                text_color="#FFFFFF",
+                state="normal",
+            )
+
+            messagebox.showerror(
+                "打开串口失败",
+                f"无法打开 {port}：\n{error}",
+                parent=self,
+            )
+            return
+
+        self.monitoring = True
+        self.monitor_stopping = False
+
+        self.monitor_btn.configure(
+            text="停止监控 ■",
+            fg_color=RED,
+            hover_color="#EF4444",
+            border_color=RED,
+            text_color="#FFFFFF",
+            state="normal",
+        )
+
+        self.lbl_com.configure(text=port)
+        self.lbl_baud.configure(text=str(baud))
+
+    def _stop_monitoring(self):
+        if self.monitor_stopping:
+            return
+
+        # 必须先设为 False，立即阻止后续数据进入 UI
+        self.monitoring = False
+        self.monitor_stopping = True
+
+        self.monitor_btn.configure(
+            text="正在停止...",
+            state="disabled",
+            fg_color="#9CA3AF",
+            hover_color="#9CA3AF",
+            border_color="#9CA3AF",
+        )
+
+        def stop_worker():
+            stop_error = None
 
             try:
-                baud = self.baud_cb.get_valid_baud()
-            except ValueError as error:
-                messagebox.showwarning("波特率错误", str(error))
-                return
-
-            try:
-                if self.worker:
-                    self.worker.connect(port, baud)
-
-                self.monitoring = True
-                self.monitor_btn.configure(
-                    text="停止监控 ■",
-                    fg_color=RED,
-                    text_color="white"
+                self.worker.disconnect(
+                    wait=True,
+                    timeout=2.0,
                 )
-
-                self.lbl_com.configure(text=port)
-
             except Exception as error:
-                messagebox.showwarning("提示", f"无法打开串口：{error}")
+                stop_error = error
+
+            self.after(
+                0,
+                self._finish_stop_monitoring,
+                stop_error,
+            )
+
+        threading.Thread(
+            target=stop_worker,
+            daemon=True,
+            name="serial-stop-worker",
+        ).start()
+
+    def _finish_stop_monitoring(self, stop_error=None):
+        self.monitoring = False
+        self.monitor_stopping = False
+
+        self.monitor_btn.configure(
+            text="开始监控 ▶",
+            state="normal",
+            fg_color=BLUE,
+            hover_color="#4096FF",
+            border_color=BLUE,
+            text_color="#FFFFFF",
+        )
+
+        if stop_error is not None and not self._closing:
+            messagebox.showwarning(
+                "停止串口提示",
+                f"停止串口时出现异常：\n{stop_error}",
+                parent=self,
+            )
+
+    def _on_serial_error(self, error):
+        self.after(
+            0,
+            self._handle_serial_error,
+            error,
+        )
+
+    def _handle_serial_error(self, error):
+        was_monitoring = self.monitoring
+
+        self.monitoring = False
+        self.monitor_stopping = False
+
+        self.monitor_btn.configure(
+            text="开始监控 ▶",
+            state="normal",
+            fg_color=BLUE,
+            hover_color="#4096FF",
+            border_color=BLUE,
+            text_color="#FFFFFF",
+        )
+
+        if was_monitoring and not self._closing:
+            messagebox.showerror(
+                "串口连接中断",
+                str(error),
+                parent=self,
+            )
+
+    def _format_rx_data(self, data):
+        if self.display_mode == "hex":
+            return data.hex(" ").upper()
+        return self._format_ascii_data(data)
+
+    @staticmethod
+    def _format_ascii_data(data):
+        chars = []
+        for byte in data:
+            if byte == 13:
+                chars.append("\\r")
+            elif byte == 10:
+                chars.append("\\n\n")
+            elif byte == 9:
+                chars.append("\\t")
+            elif 32 <= byte <= 126:
+                chars.append(chr(byte))
+            else:
+                chars.append(".")
+        return "".join(chars)
+
+    def _append_rx(self, data):
+        if not isinstance(data, bytes):
+            data = bytes(data)
+
+        self.rx_placeholder.place_forget()
+        self.rxbox.place(relx=0, rely=0, relwidth=1, relheight=1)
+
+        text = self._format_rx_data(data)
+
+        self.rxbox.insert("end", text + "\n")
+
+        if self.auto_scroll:
+            self.rxbox.see("end")
+
+    def _toggle_display_format(self):
+        if self.display_mode == "hex":
+            self.display_mode = "ascii"
+            self.hex_mode = False
+
+            self.format_button.configure(
+                text="ASCII 格式",
+                fg_color=GREEN,
+                hover_color="#22c55e",
+                border_color=GREEN,
+                text_color="#FFFFFF",
+            )
+
+            self.rxbox.configure(
+                font=ctk.CTkFont(
+                    family="Microsoft YaHei UI",
+                    size=12,
+                ),
+                wrap="char",
+            )
+
+        else:
+            self.display_mode = "hex"
+            self.hex_mode = True
+
+            self.format_button.configure(
+                text="HEX 格式",
+                fg_color=GREEN,
+                hover_color="#22c55e",
+                border_color=GREEN,
+                text_color="#FFFFFF",
+            )
+
+            self.rxbox.configure(
+                font=ctk.CTkFont(
+                    family="Consolas",
+                    size=12,
+                ),
+                wrap="none",
+            )
+
+        self._rerender_rx_history()
+
+    def _rerender_rx_history(self):
+        self.rxbox.delete("0.0", "end")
+
+        if not self.rx_history:
+            self.rxbox.place_forget()
+            self.rx_placeholder.place(
+                relx=0.5,
+                rely=0.5,
+                anchor="center",
+            )
+            return
+
+        self.rx_placeholder.place_forget()
+
+        self.rxbox.place(
+            relx=0,
+            rely=0,
+            relwidth=1,
+            relheight=1,
+        )
+
+        for data in self.rx_history:
+            text = self._format_rx_data(data)
+            self.rxbox.insert("end", text + "\n")
+
+        if self.auto_scroll:
+            self.rxbox.see("end")
 
     def _toggle_hex(self):
-        self.hex_mode = not self.hex_mode
+        self._toggle_display_format()
 
     def _toggle_storage(self):
         if not self.raw_saver.active:
@@ -1221,6 +1482,7 @@ class SerialApp(ctk.CTk):
             messagebox.showerror("协议加载失败", str(error))
 
     def _clear_rx(self):
+        self.rx_history.clear()
         self.rxbox.delete("0.0", "end")
         self.rx_placeholder.place(relx=0.5, rely=0.5, anchor="center")
         self.rxbox.place_forget()
@@ -1245,15 +1507,32 @@ class SerialApp(ctk.CTk):
                                          border_width=0)
 
     def _on_serial_data(self, data):
-        """串口回调线程：入队原始数据 + 转发到 UI 线程解析显示。"""
+        """串口回调线程：第一层状态检查 + 入队原始数据 + 转发到 UI 线程。"""
+        if not self.monitoring:
+            return
+
+        raw_data = bytes(data)
         timestamp = time.time()
 
         # 原始数据实时落盘（在工作线程中执行，不阻塞串口接收）
         if self.raw_saver.active:
-            self.raw_saver.enqueue_rx(data, timestamp)
+            self.raw_saver.enqueue_rx(raw_data, timestamp)
 
-        # 转发到 UI 线程处理显示和协议解析
-        self.after(0, self._process_received_data, data, timestamp)
+        # 转发到 UI 线程处理（第二层检查在 _append_rx_if_monitoring）
+        self.after(
+            0,
+            self._append_rx_if_monitoring,
+            raw_data,
+            timestamp,
+        )
+
+    def _append_rx_if_monitoring(self, data, timestamp):
+        """UI 线程：第二层状态检查，通过后保存历史并显示。"""
+        if not self.monitoring:
+            return
+
+        self.rx_history.append(data)
+        self._process_received_data(data, timestamp)
 
     def _process_received_data(self, data, timestamp):
         """UI 线程：根据模式分流处理接收数据。"""
@@ -1261,12 +1540,8 @@ class SerialApp(ctk.CTk):
         self.rxbox.place(relx=0, rely=0, relwidth=1, relheight=1)
 
         if not self.parse_mode:
-            # 原始数据模式：直接显示 HEX 或 ASCII
-            text = (
-                data.hex(" ").upper()
-                if self.hex_mode
-                else data.decode("utf-8", errors="replace")
-            )
+            # 原始数据模式：使用统一格式化函数
+            text = self._format_rx_data(data)
             self.rxbox.insert("end", text + "\n")
         else:
             # 协议解析模式：帧同步 → parse_frame → 显示解析结果
@@ -1277,6 +1552,9 @@ class SerialApp(ctk.CTk):
 
     def _process_protocol_data(self, data, timestamp):
         """协议模式：通过 FrameSynchronizer 切帧后逐帧解析。"""
+        if not self.monitoring:
+            return
+
         if self.frame_synchronizer is None:
             self.rxbox.insert("end", f"[{self._fmt_ts(timestamp)}] 协议同步器未初始化\n")
             return
@@ -1747,6 +2025,18 @@ class SerialApp(ctk.CTk):
 
     def _on_close(self):
         """窗口关闭时安全释放所有资源。"""
+        self._closing = True
+        self.monitoring = False
+
+        try:
+            if self.worker:
+                self.worker.disconnect(
+                    wait=True,
+                    timeout=2.0,
+                )
+        except Exception:
+            pass
+
         try:
             if self.raw_saver.active:
                 self.raw_saver.stop(flush=True)
@@ -1756,12 +2046,6 @@ class SerialApp(ctk.CTk):
         try:
             if self.result_logger:
                 self.result_logger.close()
-        except Exception:
-            pass
-
-        try:
-            if self.worker:
-                self.worker.close()
         except Exception:
             pass
 

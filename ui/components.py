@@ -18,28 +18,17 @@ HEADER_BG = "#f8fafc"
 # 常用波特率列表（从小到大排列）
 # =========================
 COMMON_BAUD_RATES = [
+    "1200",
+    "2400",
+    "4800",
     "9600",
-    "14400",
     "19200",
-    "28800",
     "38400",
-    "56000",
     "57600",
-    "76800",
     "115200",
-    "128000",
     "230400",
-    "256000",
     "460800",
-    "500000",
-    "512000",
-    "576000",
-    "600000",
-    "750000",
     "921600",
-    "1000000",
-    "1500000",
-    "2000000",
 ]
 
 # =========================
@@ -212,7 +201,11 @@ class ReadOnlyDropdown(ctk.CTkFrame):
         # 弹层父容器（主窗口或弹窗），下拉列表作为其内部浮动 Frame
         self._popup_parent = None
         self._outside_bind_id = None
+        self._configure_bind_id = None
         self._bind_job = None
+
+        # 防止弹层尚未创建完成就被 Configure 事件关闭
+        self._building_popup = False
 
         initial_value = default if default in self._values else self._values[0]
         self.variable = variable or ctk.StringVar(value=initial_value)
@@ -268,19 +261,52 @@ class ReadOnlyDropdown(ctk.CTkFrame):
         self._border_entry.bind("<Button-1>", self._toggle_popup)
         self.value_label.bind("<Button-1>", self._toggle_popup)
 
+    def _pixel_to_logical(self, value):
+        try:
+            return int(
+                round(
+                    self._reverse_widget_scaling(
+                        value
+                    )
+                )
+            )
+        except Exception:
+            return int(round(value))
+
+    def _on_parent_configure(self, event=None):
+        if self._building_popup:
+            return
+
+        if self._popup is None:
+            return
+
+        # 仅主窗口真正移动或改变尺寸时关闭
+        root = self.winfo_toplevel()
+
+        if event is not None and event.widget is not root:
+            return
+
+        self.after_idle(self._close_popup)
+
     def _toggle_popup(self, event=None):
+        if self._building_popup:
+            return
+
         if self._popup is not None:
             try:
                 if self._popup.winfo_exists():
                     self._close_popup()
                     return "break"
-            except tk.TclError:
+            except Exception:
                 self._popup = None
 
         self._open_popup()
         return "break"
 
     def _open_popup(self):
+        if self._building_popup:
+            return
+
         if not self._values:
             return
 
@@ -293,154 +319,170 @@ class ReadOnlyDropdown(ctk.CTkFrame):
                 pass
         ReadOnlyDropdown._open_instance = self
 
-        self.update_idletasks()
+        self._building_popup = True
 
-        popup_width = self.winfo_width()
-        if popup_width <= 1:
-            popup_width = self._width
+        try:
+            self.update_idletasks()
 
-        max_visible_rows = 6
-        visible_rows = min(
-            max(len(self._values), 1),
-            max_visible_rows,
-        )
+            popup_parent = self.winfo_toplevel()
+            popup_parent.update_idletasks()
 
-        # 每一行与下拉框本身高度完全一致
-        row_height = self._height
-
-        # 外层上下边框各 1px，因此只额外增加 2px
-        popup_height = visible_rows * row_height + 2
-
-        # 使用当前下拉框所在的主窗口或弹窗作为父容器，
-        # 下拉列表作为其内部浮动 Frame，不会创建新窗口，主窗口不会失焦。
-        self._popup_parent = self.winfo_toplevel()
-        self._popup_parent.update_idletasks()
-
-        # 将屏幕坐标转换成父窗口内部坐标
-        popup_x = (
-            self.winfo_rootx()
-            - self._popup_parent.winfo_rootx()
-        )
-
-        popup_y = (
-            self.winfo_rooty()
-            - self._popup_parent.winfo_rooty()
-            + self.winfo_height()
-            + 1
-        )
-
-        # 屏幕底部空间不足时，改为向上弹出。
-        screen_height = self.winfo_screenheight()
-        if self.winfo_rooty() + popup_height > screen_height:
-            popup_y = (
+            # winfo_* 返回的是物理像素
+            x_pixels = (
+                self.winfo_rootx()
+                - popup_parent.winfo_rootx()
+            )
+            y_pixels = (
                 self.winfo_rooty()
-                - self._popup_parent.winfo_rooty()
-                - popup_height
-                - 1
+                - popup_parent.winfo_rooty()
+                + self.winfo_height()
+                + 1
             )
 
-        # 不再创建 Toplevel，只创建主窗口内部的浮动 Frame。
-        # CTkFrame 的尺寸必须写在构造函数中，不能在 place() 里传 width/height。
-        self._popup = ctk.CTkFrame(
-            self._popup_parent,
-            width=popup_width,
-            height=popup_height,
-            fg_color="#FFFFFF",
-            border_width=1,
-            border_color="#D7DEE8",
-            corner_radius=6,
-        )
+            # 防止下拉框超出窗口右侧（物理像素判断）
+            parent_width_pixels = popup_parent.winfo_width()
+            popup_width_pixels = self.winfo_width()
+            if popup_width_pixels <= 1:
+                popup_width_pixels = self._width
+            if x_pixels + popup_width_pixels > parent_width_pixels:
+                x_pixels = max(
+                    0,
+                    parent_width_pixels - popup_width_pixels - 4,
+                )
 
-        self._popup.place(
-            x=popup_x,
-            y=popup_y,
-        )
+            # 屏幕底部空间不足时，改为向上弹出
+            screen_height = self.winfo_screenheight()
+            popup_height_pixels_est = (
+                min(max(len(self._values), 1), 8) * self.winfo_height() + 2
+                if self.winfo_height() > 1 else self._height * 8
+            )
+            if self.winfo_rooty() + popup_height_pixels_est > screen_height:
+                y_pixels = (
+                    self.winfo_rooty()
+                    - popup_parent.winfo_rooty()
+                    - popup_height_pixels_est
+                    - 1
+                )
 
-        self._popup.pack_propagate(False)
+            # 转换为 CustomTkinter 使用的逻辑坐标
+            popup_x = self._pixel_to_logical(x_pixels)
+            popup_y = self._pixel_to_logical(y_pixels)
 
-        # 保证显示在主窗口其他控件上方
-        self._popup.lift()
+            popup_width = self._width
+            row_height = self._height
+            max_visible_rows = 8
+            visible_rows = min(
+                max(len(self._values), 1),
+                max_visible_rows,
+            )
+            popup_height = visible_rows * row_height + 2
 
-        # 项目较少时不显示滚动条，避免滚动条占用额外宽度导致内容区变窄。
-        if len(self._values) <= max_visible_rows:
-            list_frame = ctk.CTkFrame(
-                self._popup,
+            self._popup_parent = popup_parent
+
+            self._popup = ctk.CTkFrame(
+                popup_parent,
+                width=popup_width,
+                height=popup_height,
                 fg_color="#FFFFFF",
-                corner_radius=5,
-                border_width=0,
+                border_width=1,
+                border_color="#D7DEE8",
+                corner_radius=6,
             )
-        else:
-            list_frame = ctk.CTkScrollableFrame(
-                self._popup,
-                fg_color="#FFFFFF",
-                corner_radius=5,
-                border_width=0,
-                scrollbar_button_color="#CBD5E1",
-                scrollbar_button_hover_color="#94A3B8",
-            )
+            self._popup.place(x=popup_x, y=popup_y)
+            self._popup.pack_propagate(False)
+            self._popup.grid_propagate(False)
+            self._popup.lift()
 
-        # 外层上下各留 1px 给边框，内部高度刚好等于 visible_rows * row_height。
-        list_frame.pack(
-            fill="both",
-            expand=True,
-            padx=1,
-            pady=1,
+            # 项目较少时使用普通 Frame
+            if len(self._values) <= max_visible_rows:
+                list_frame = ctk.CTkFrame(
+                    self._popup,
+                    width=popup_width - 2,
+                    height=popup_height - 2,
+                    fg_color="#FFFFFF",
+                    corner_radius=5,
+                )
+            else:
+                # 必须先确保 popup 已完成布局，再创建滚动框
+                self._popup.update_idletasks()
+
+                list_frame = ctk.CTkScrollableFrame(
+                    self._popup,
+                    width=popup_width - 2,
+                    height=popup_height - 2,
+                    fg_color="#FFFFFF",
+                    corner_radius=5,
+                    scrollbar_button_color="#CBD5E1",
+                    scrollbar_button_hover_color="#94A3B8",
+                )
+
+            list_frame.pack(fill="both", expand=True, padx=1, pady=1)
+            list_frame.pack_propagate(False)
+
+            for value in self._values:
+                self._create_popup_item(list_frame, value, row_height)
+
+            self._popup.update_idletasks()
+            self._popup.lift()
+
+        except Exception:
+            # 创建失败时清理半成品，避免残留无效 Canvas
+            self._destroy_popup_only()
+            raise
+
+        finally:
+            self._building_popup = False
+
+        # 必须等整个弹层构建完成后再绑定事件
+        self.after_idle(self._bind_popup_events)
+
+    def _create_popup_item(self, parent, value, row_height):
+        selected = str(value) == self.variable.get()
+
+        item = ctk.CTkButton(
+            parent,
+            text=str(value),
+            height=row_height,
+            anchor="w",
+            corner_radius=0,
+            fg_color="#EAF3FF" if selected else "#FFFFFF",
+            hover_color="#D6E9FF",
+            text_color="#202124",
+            border_width=0,
+            font=FONT_NORMAL,
+            cursor="hand2",
+            command=lambda selected_value=value: self._select(selected_value),
         )
+        item.pack(fill="x", padx=0, pady=0)
 
-        # 统一使用 grid 布局，行高更稳定，不会被 pack 重新计算。
-        list_frame.grid_columnconfigure(0, weight=1)
+    def _bind_popup_events(self):
+        if self._building_popup:
+            return
 
-        for row_index, value in enumerate(self._values):
-            selected = value == self.variable.get()
-
-            item = ctk.CTkButton(
-                list_frame,
-                text=value,
-
-                # 与原下拉框高度完全一致
-                height=row_height,
-
-                anchor="w",
-
-                # 取消圆角，悬停背景完整覆盖整行
-                corner_radius=0,
-
-                # 当前已选项使用较浅背景
-                fg_color="#EAF3FF" if selected else "#FFFFFF",
-
-                # 鼠标悬停颜色比选中背景略深，确保看得出变化
-                hover_color="#D6E9FF",
-
-                text_color="#202124",
-                border_width=0,
-                font=FONT_NORMAL,
-                cursor="hand2",
-
-                command=lambda selected_value=value: self._select(
-                    selected_value
-                ),
-            )
-            item.grid(
-                row=row_index,
-                column=0,
-                sticky="ew",
-                padx=0,
-                pady=0,
-            )
-
-        # 延迟绑定主窗口点击，避免本次打开点击被当成“外部点击”立即关闭。
-        self._bind_job = self.after(120, self._bind_outside_click)
-
-    def _bind_outside_click(self):
-        self._bind_job = None
         if self._popup is None:
             return
+
+        try:
+            if not self._popup.winfo_exists():
+                return
+        except Exception:
+            return
+
         root = self.winfo_toplevel()
-        self._outside_bind_id = root.bind(
-            "<Button-1>",
-            self._on_root_click,
-            add="+",
-        )
+
+        if self._outside_bind_id is None:
+            self._outside_bind_id = root.bind(
+                "<Button-1>",
+                self._on_root_click,
+                add="+",
+            )
+
+        if self._configure_bind_id is None:
+            self._configure_bind_id = root.bind(
+                "<Configure>",
+                self._on_parent_configure,
+                add="+",
+            )
 
     @staticmethod
     def _is_descendant(widget, ancestor):
@@ -468,15 +510,29 @@ class ReadOnlyDropdown(ctk.CTkFrame):
 
         self._close_popup()
 
-    def _close_popup(self):
-        if self._bind_job is not None:
+    def _destroy_popup_only(self):
+        popup = self._popup
+
+        # 必须先清空引用，避免 destroy 过程中再次触发关闭
+        self._popup = None
+        self._popup_parent = None
+
+        if popup is not None:
             try:
-                self.after_cancel(self._bind_job)
+                if popup.winfo_exists():
+                    popup.destroy()
             except Exception:
                 pass
-            self._bind_job = None
+
+        if ReadOnlyDropdown._open_instance is self:
+            ReadOnlyDropdown._open_instance = None
+
+    def _close_popup(self):
+        if self._building_popup:
+            return
 
         root = self.winfo_toplevel()
+
         if self._outside_bind_id is not None:
             try:
                 root.unbind("<Button-1>", self._outside_bind_id)
@@ -484,18 +540,14 @@ class ReadOnlyDropdown(ctk.CTkFrame):
                 pass
             self._outside_bind_id = None
 
-        if self._popup is not None:
+        if self._configure_bind_id is not None:
             try:
-                if self._popup.winfo_exists():
-                    self._popup.destroy()
+                root.unbind("<Configure>", self._configure_bind_id)
             except Exception:
                 pass
+            self._configure_bind_id = None
 
-        self._popup = None
-        self._popup_parent = None
-
-        if ReadOnlyDropdown._open_instance is self:
-            ReadOnlyDropdown._open_instance = None
+        self._destroy_popup_only()
 
     def _select(self, value):
         self.variable.set(value)
@@ -550,7 +602,11 @@ class EditableBaudDropdown(ctk.CTkFrame):
         self._popup = None
         self._popup_parent = None
         self._outside_bind_id = None
+        self._configure_bind_id = None
         self._bind_job = None
+
+        # 防止弹层尚未创建完成就被 Configure 事件关闭
+        self._building_popup = False
 
         self.variable = ctk.StringVar(value=str(default))
 
@@ -607,6 +663,33 @@ class EditableBaudDropdown(ctk.CTkFrame):
         self.entry.bind("<Return>", self._confirm_input)
         self.entry.bind("<FocusOut>", self._validate_after_focus)
 
+    def _pixel_to_logical(self, value):
+        try:
+            return int(
+                round(
+                    self._reverse_widget_scaling(
+                        value
+                    )
+                )
+            )
+        except Exception:
+            return int(round(value))
+
+    def _on_parent_configure(self, event=None):
+        if self._building_popup:
+            return
+
+        if self._popup is None:
+            return
+
+        # 仅主窗口真正移动或改变尺寸时关闭
+        root = self.winfo_toplevel()
+
+        if event is not None and event.widget is not root:
+            return
+
+        self.after_idle(self._close_popup)
+
     # ---------- 输入校验 ----------
 
     def _validate_typing(self, new_value):
@@ -661,135 +744,179 @@ class EditableBaudDropdown(ctk.CTkFrame):
     # ---------- 弹层开关 ----------
 
     def _toggle_popup(self, event=None):
+        if self._building_popup:
+            return
+
         if self._popup is not None:
             try:
                 if self._popup.winfo_exists():
                     self._close_popup()
                     return
-            except tk.TclError:
+            except Exception:
                 self._popup = None
 
         self._open_popup()
 
     def _open_popup(self):
+        if self._building_popup:
+            return
+
         if not self._values:
             return
 
-        self.update_idletasks()
+        # 波特率列表最多显示 10 项，不使用 CTkScrollableFrame
+        visible_values = self._values[:10]
 
-        popup_width = self.winfo_width()
-        if popup_width <= 1:
-            popup_width = self._width
+        self._building_popup = True
 
-        max_visible_rows = 8
-        visible_rows = min(
-            max(len(self._values), 1),
-            max_visible_rows,
-        )
+        try:
+            self.update_idletasks()
 
-        row_height = self._height
-        popup_height = visible_rows * row_height + 2
+            popup_parent = self.winfo_toplevel()
+            popup_parent.update_idletasks()
 
-        # 使用当前控件所在的主窗口或弹窗作为父容器，下拉列表作为内部浮动 Frame
-        self._popup_parent = self.winfo_toplevel()
-        self._popup_parent.update_idletasks()
-
-        popup_x = (
-            self.winfo_rootx()
-            - self._popup_parent.winfo_rootx()
-        )
-        popup_y = (
-            self.winfo_rooty()
-            - self._popup_parent.winfo_rooty()
-            + self.winfo_height()
-            + 1
-        )
-
-        # 屏幕底部空间不足时，改为向上弹出
-        screen_height = self.winfo_screenheight()
-        if self.winfo_rooty() + popup_height > screen_height:
-            popup_y = (
+            # winfo_* 返回的是物理像素
+            x_pixels = (
+                self.winfo_rootx()
+                - popup_parent.winfo_rootx()
+            )
+            y_pixels = (
                 self.winfo_rooty()
-                - self._popup_parent.winfo_rooty()
-                - popup_height
-                - 1
+                - popup_parent.winfo_rooty()
+                + self.winfo_height()
+                + 1
             )
 
-        self._popup = ctk.CTkFrame(
-            self._popup_parent,
-            width=popup_width,
-            height=popup_height,
-            fg_color="#FFFFFF",
-            border_width=1,
-            border_color="#D7DEE8",
-            corner_radius=6,
-        )
-        self._popup.place(x=popup_x, y=popup_y)
-        self._popup.pack_propagate(False)
-        self._popup.lift()
+            # 防止下拉框超出窗口右侧（物理像素判断）
+            parent_width_pixels = popup_parent.winfo_width()
+            popup_width_pixels = self.winfo_width()
+            if popup_width_pixels <= 1:
+                popup_width_pixels = self._width
+            if x_pixels + popup_width_pixels > parent_width_pixels:
+                x_pixels = max(
+                    0,
+                    parent_width_pixels - popup_width_pixels - 4,
+                )
 
-        if len(self._values) <= max_visible_rows:
+            # 屏幕底部空间不足时，改为向上弹出
+            screen_height = self.winfo_screenheight()
+            popup_height_pixels_est = (
+                min(max(len(visible_values), 1), 10) * self.winfo_height() + 2
+                if self.winfo_height() > 1 else self._height * 10
+            )
+            if self.winfo_rooty() + popup_height_pixels_est > screen_height:
+                y_pixels = (
+                    self.winfo_rooty()
+                    - popup_parent.winfo_rooty()
+                    - popup_height_pixels_est
+                    - 1
+                )
+
+            # 转换为 CustomTkinter 使用的逻辑坐标
+            popup_x = self._pixel_to_logical(x_pixels)
+            popup_y = self._pixel_to_logical(y_pixels)
+
+            popup_width = self._width
+            row_height = self._height
+            max_visible_rows = 10
+            visible_rows = min(
+                max(len(visible_values), 1),
+                max_visible_rows,
+            )
+            popup_height = visible_rows * row_height + 2
+
+            self._popup_parent = popup_parent
+
+            self._popup = ctk.CTkFrame(
+                popup_parent,
+                width=popup_width,
+                height=popup_height,
+                fg_color="#FFFFFF",
+                border_width=1,
+                border_color="#D7DEE8",
+                corner_radius=6,
+            )
+            self._popup.place(x=popup_x, y=popup_y)
+            self._popup.pack_propagate(False)
+            self._popup.grid_propagate(False)
+            self._popup.lift()
+
+            # 波特率列表只使用普通 Frame，不创建 CTkScrollableFrame
             list_frame = ctk.CTkFrame(
                 self._popup,
+                width=popup_width - 2,
+                height=popup_height - 2,
                 fg_color="#FFFFFF",
                 corner_radius=5,
-                border_width=0,
-            )
-        else:
-            list_frame = ctk.CTkScrollableFrame(
-                self._popup,
-                fg_color="#FFFFFF",
-                corner_radius=5,
-                border_width=0,
-                scrollbar_button_color="#CBD5E1",
-                scrollbar_button_hover_color="#94A3B8",
             )
 
-        list_frame.pack(fill="both", expand=True, padx=1, pady=1)
-        list_frame.grid_columnconfigure(0, weight=1)
+            list_frame.pack(fill="both", expand=True, padx=1, pady=1)
+            list_frame.pack_propagate(False)
 
-        current_value = self.variable.get()
+            for value in visible_values:
+                self._create_popup_item(list_frame, value, row_height)
 
-        for row_index, value in enumerate(self._values):
-            selected = value == current_value
+            self._popup.update_idletasks()
+            self._popup.lift()
 
-            item = ctk.CTkButton(
-                list_frame,
-                text=value,
-                height=row_height,
-                anchor="w",
-                corner_radius=0,
-                fg_color="#EAF3FF" if selected else "#FFFFFF",
-                hover_color="#D6E9FF",
-                text_color="#202124",
-                border_width=0,
-                font=FONT_NORMAL,
-                cursor="hand2",
-                command=lambda selected_value=value: self._select(
-                    selected_value
-                ),
-            )
-            item.grid(
-                row=row_index,
-                column=0,
-                sticky="ew",
-                padx=0,
-                pady=0,
-            )
+        except Exception:
+            # 创建失败时清理半成品，避免残留无效 Canvas
+            self._destroy_popup_only()
+            raise
 
-        # 延迟绑定主窗口点击，避免本次打开点击被当成“外部点击”立即关闭
-        self._bind_job = self.after(120, self._bind_outside_click)
+        finally:
+            self._building_popup = False
 
-    def _bind_outside_click(self):
+        # 必须等整个弹层构建完成后再绑定事件
+        self.after_idle(self._bind_popup_events)
+
+    def _create_popup_item(self, parent, value, row_height):
+        selected = str(value) == self.variable.get()
+
+        item = ctk.CTkButton(
+            parent,
+            text=str(value),
+            height=row_height,
+            anchor="w",
+            corner_radius=0,
+            fg_color="#EAF3FF" if selected else "#FFFFFF",
+            hover_color="#D6E9FF",
+            text_color="#202124",
+            border_width=0,
+            font=FONT_NORMAL,
+            cursor="hand2",
+            command=lambda selected_value=value: self._select(selected_value),
+        )
+        item.pack(fill="x", padx=0, pady=0)
+
+    def _bind_popup_events(self):
+        if self._building_popup:
+            return
+
         if self._popup is None:
             return
 
+        try:
+            if not self._popup.winfo_exists():
+                return
+        except Exception:
+            return
+
         root = self.winfo_toplevel()
-        self._outside_bind_id = root.bind(
-            "<Button-1>",
-            self._on_root_click,
-            add="+",
-        )
+
+        if self._outside_bind_id is None:
+            self._outside_bind_id = root.bind(
+                "<Button-1>",
+                self._on_root_click,
+                add="+",
+            )
+
+        if self._configure_bind_id is None:
+            self._configure_bind_id = root.bind(
+                "<Configure>",
+                self._on_parent_configure,
+                add="+",
+            )
 
     @staticmethod
     def _is_descendant(widget, ancestor):
@@ -817,15 +944,26 @@ class EditableBaudDropdown(ctk.CTkFrame):
 
         self._close_popup()
 
-    def _close_popup(self):
-        if self._bind_job is not None:
+    def _destroy_popup_only(self):
+        popup = self._popup
+
+        # 必须先清空引用，避免 destroy 过程中再次触发关闭
+        self._popup = None
+        self._popup_parent = None
+
+        if popup is not None:
             try:
-                self.after_cancel(self._bind_job)
+                if popup.winfo_exists():
+                    popup.destroy()
             except Exception:
                 pass
-            self._bind_job = None
+
+    def _close_popup(self):
+        if self._building_popup:
+            return
 
         root = self.winfo_toplevel()
+
         if self._outside_bind_id is not None:
             try:
                 root.unbind("<Button-1>", self._outside_bind_id)
@@ -833,15 +971,14 @@ class EditableBaudDropdown(ctk.CTkFrame):
                 pass
             self._outside_bind_id = None
 
-        if self._popup is not None:
+        if self._configure_bind_id is not None:
             try:
-                if self._popup.winfo_exists():
-                    self._popup.destroy()
+                root.unbind("<Configure>", self._configure_bind_id)
             except Exception:
                 pass
+            self._configure_bind_id = None
 
-        self._popup = None
-        self._popup_parent = None
+        self._destroy_popup_only()
 
     def _select(self, value):
         self.variable.set(str(value))
