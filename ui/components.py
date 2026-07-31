@@ -15,20 +15,39 @@ TEXT_LIGHT = "#6b7280"
 HEADER_BG = "#f8fafc"
 
 # =========================
+# 全局按钮布局参数
+# =========================
+BUTTON_GAP_X = 8
+BUTTON_GAP_Y = 6
+BUTTON_PAD_X = BUTTON_GAP_X // 2
+BUTTON_PAD_Y = BUTTON_GAP_Y // 2
+
+# =========================
 # 常用波特率列表（从小到大排列）
 # =========================
 COMMON_BAUD_RATES = [
-    "1200",
-    "2400",
     "4800",
     "9600",
+    "14400",
     "19200",
+    "28800",
     "38400",
+    "56000",
     "57600",
+    "76800",
     "115200",
+    "128000",
     "230400",
+    "256000",
     "460800",
+    "500000",
+    "512000",
+    "576000",
+    "600000",
+    "750000",
     "921600",
+    "1000000",
+    "2000000",
 ]
 
 # =========================
@@ -109,6 +128,22 @@ def IconBtn(parent, icon, color="normal", command=None, size=28, **kw):
         **kw,
     )
     return btn
+
+
+def pack_button(widget, side="left", **kwargs):
+    """统一使用 pack 布局的按钮外部间距。"""
+    kwargs.setdefault("padx", BUTTON_PAD_X)
+    kwargs.setdefault("pady", BUTTON_PAD_Y)
+    widget.pack(side=side, **kwargs)
+    return widget
+
+
+def grid_button(widget, row, column, **kwargs):
+    """统一使用 grid 布局的按钮外部间距。"""
+    kwargs.setdefault("padx", BUTTON_PAD_X)
+    kwargs.setdefault("pady", BUTTON_PAD_Y)
+    widget.grid(row=row, column=column, **kwargs)
+    return widget
 
 
 def Label(parent, text, **kw):
@@ -608,6 +643,9 @@ class EditableBaudDropdown(ctk.CTkFrame):
         # 防止弹层尚未创建完成就被 Configure 事件关闭
         self._building_popup = False
 
+        # 防重复触发：值变化时才执行 command
+        self._last_confirmed_value = str(default)
+
         self.variable = ctk.StringVar(value=str(default))
 
         self.pack_propagate(False)
@@ -722,8 +760,7 @@ class EditableBaudDropdown(ctk.CTkFrame):
             baud = self.get_valid_baud()
             # 统一格式，去除开头的 0
             self.variable.set(str(baud))
-            if self._command is not None:
-                self._command(str(baud))
+            self._fire_command_if_changed(str(baud))
         except ValueError:
             self.variable.set("9600")
 
@@ -734,12 +771,28 @@ class EditableBaudDropdown(ctk.CTkFrame):
 
         if value == "":
             self.variable.set("9600")
+            self._fire_command_if_changed("9600")
             return
 
         try:
-            self.variable.set(str(self.get_valid_baud()))
+            baud = self.get_valid_baud()
+            normalized = str(baud)
+            self.variable.set(normalized)
+            self._fire_command_if_changed(normalized)
         except ValueError:
             self.variable.set("9600")
+            self._fire_command_if_changed("9600")
+
+    def _fire_command_if_changed(self, value):
+        """只有值真正变化时才触发 command，避免 Enter/FocusOut 双重触发。"""
+        if value == self._last_confirmed_value:
+            return
+        self._last_confirmed_value = value
+        if self._command is not None:
+            try:
+                self._command(value)
+            except Exception:
+                pass
 
     # ---------- 弹层开关 ----------
 
@@ -763,9 +816,6 @@ class EditableBaudDropdown(ctk.CTkFrame):
 
         if not self._values:
             return
-
-        # 波特率列表最多显示 10 项，不使用 CTkScrollableFrame
-        visible_values = self._values[:10]
 
         self._building_popup = True
 
@@ -801,7 +851,7 @@ class EditableBaudDropdown(ctk.CTkFrame):
             # 屏幕底部空间不足时，改为向上弹出
             screen_height = self.winfo_screenheight()
             popup_height_pixels_est = (
-                min(max(len(visible_values), 1), 10) * self.winfo_height() + 2
+                min(max(len(self._values), 1), 10) * self.winfo_height() + 2
                 if self.winfo_height() > 1 else self._height * 10
             )
             if self.winfo_rooty() + popup_height_pixels_est > screen_height:
@@ -820,7 +870,7 @@ class EditableBaudDropdown(ctk.CTkFrame):
             row_height = self._height
             max_visible_rows = 10
             visible_rows = min(
-                max(len(visible_values), 1),
+                max(len(self._values), 1),
                 max_visible_rows,
             )
             popup_height = visible_rows * row_height + 2
@@ -841,19 +891,22 @@ class EditableBaudDropdown(ctk.CTkFrame):
             self._popup.grid_propagate(False)
             self._popup.lift()
 
-            # 波特率列表只使用普通 Frame，不创建 CTkScrollableFrame
-            list_frame = ctk.CTkFrame(
+            # 使用 CTkScrollableFrame 支持滚动查看所有波特率
+            self._popup.update_idletasks()
+
+            list_frame = ctk.CTkScrollableFrame(
                 self._popup,
                 width=popup_width - 2,
                 height=popup_height - 2,
                 fg_color="#FFFFFF",
                 corner_radius=5,
+                scrollbar_button_color="#CBD5E1",
+                scrollbar_button_hover_color="#94A3B8",
             )
 
             list_frame.pack(fill="both", expand=True, padx=1, pady=1)
-            list_frame.pack_propagate(False)
 
-            for value in visible_values:
+            for value in self._values:
                 self._create_popup_item(list_frame, value, row_height)
 
             self._popup.update_idletasks()
@@ -981,11 +1034,9 @@ class EditableBaudDropdown(ctk.CTkFrame):
         self._destroy_popup_only()
 
     def _select(self, value):
-        self.variable.set(str(value))
-
-        if self._command is not None:
-            self._command(str(value))
-
+        normalized = str(value)
+        self.variable.set(normalized)
+        self._fire_command_if_changed(normalized)
         self._close_popup()
 
         # 选择后将光标放回输入框
@@ -998,7 +1049,10 @@ class EditableBaudDropdown(ctk.CTkFrame):
         return self.variable.get().strip()
 
     def set(self, value):
-        self.variable.set(str(value))
+        normalized = str(value)
+        self.variable.set(normalized)
+        # set() 仅同步状态，不触发 command
+        self._last_confirmed_value = normalized
 
     def set_values(self, values, default=None):
         self._values = [str(v) for v in values] if values else ["9600"]

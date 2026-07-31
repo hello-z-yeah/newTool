@@ -3,6 +3,7 @@ import os
 import subprocess
 import sys
 import time
+from datetime import datetime
 import threading
 from collections import deque
 import customtkinter as ctk
@@ -26,6 +27,12 @@ from .components import (
     FONT_TITLE,
     FONT_LARGE,
     HEIGHT_HEADER,
+    BUTTON_GAP_X,
+    BUTTON_GAP_Y,
+    BUTTON_PAD_X,
+    BUTTON_PAD_Y,
+    pack_button,
+    grid_button,
 )
 from protocol_parser.protocol_manager import ProtocolManager
 from protocol_parser import (
@@ -81,10 +88,21 @@ class SerialApp(ctk.CTk):
         self.monitoring = False
         self.monitor_stopping = False
         self._closing = False
+
+        # 正在切换串口参数
+        self.serial_reconfiguring = False
+        # 防抖 ID 与 待处理标记
+        self._reconfigure_after_id = None
+        self._reconfigure_pending = False
+        # 当前真正生效的串口参数
+        self.active_serial_config = None
+        # 防止旧任务覆盖新任务
+        self._serial_config_generation = 0
+
         self.selected_command_index = None
         # True=协议解析模式(绿底白字, 显示协议控件)
         # False=原始数据模式(白底黑字, 隐藏协议控件)
-        self.parse_mode = True
+        self.parse_mode = False
 
         # 保存最近接收的原始 bytes（HEX/ASCII 切换时重新渲染）
         self.rx_history = deque(maxlen=2000)
@@ -148,6 +166,9 @@ class SerialApp(ctk.CTk):
         # 所有控件创建完成后统一应用初始状态
         self._apply_initial_panel_state()
 
+        # 协议解析模式默认关闭（隐藏协议相关控件）
+        self._set_parse_mode(False)
+
     # ─────────────────────────────────────────────────────────────────
     # ROOT
     # ─────────────────────────────────────────────────────────────────
@@ -185,7 +206,7 @@ class SerialApp(ctk.CTk):
             initial_active=False,
             command=self.toggle_send,
         )
-        self.nav_send_button.pack(side="left", fill="y")
+        self.nav_send_button.pack(side="left", fill="y", padx=BUTTON_PAD_X)
 
         self.nav_library_button = NavActionButton(
             nav,
@@ -196,7 +217,7 @@ class SerialApp(ctk.CTk):
             initial_active=False,
             command=self.toggle_library,
         )
-        self.nav_library_button.pack(side="left", fill="y")
+        self.nav_library_button.pack(side="left", fill="y", padx=BUTTON_PAD_X)
 
         self.nav_add_button = NavActionButton(
             nav,
@@ -206,7 +227,7 @@ class SerialApp(ctk.CTk):
             height=HEIGHT_HEADER,
             command=self._open_add_serial_dialog,
         )
-        self.nav_add_button.pack(side="left", fill="y")
+        self.nav_add_button.pack(side="left", fill="y", padx=BUTTON_PAD_X)
 
         self.nav_save_button = NavActionButton(
             nav,
@@ -216,7 +237,7 @@ class SerialApp(ctk.CTk):
             height=HEIGHT_HEADER,
             command=self._open_save_log_dialog,
         )
-        self.nav_save_button.pack(side="left", fill="y")
+        self.nav_save_button.pack(side="left", fill="y", padx=BUTTON_PAD_X)
 
         self.nav_topmost_button = NavActionButton(
             nav,
@@ -226,7 +247,7 @@ class SerialApp(ctk.CTk):
             height=HEIGHT_HEADER,
             command=self._toggle_topmost,
         )
-        self.nav_topmost_button.pack(side="left", fill="y")
+        self.nav_topmost_button.pack(side="left", fill="y", padx=BUTTON_PAD_X)
 
     # ─────────────────────────────────────────────────────────────────
     # CONFIG CARD
@@ -282,13 +303,15 @@ class SerialApp(ctk.CTk):
             self.serial_config_header, values=port_values,
             width=420, height=CONTROL_HEIGHT,
             default=initial_display,
+            command=self._on_serial_setting_changed,
         )
         self.com_port.grid(row=0, column=1, sticky="ns")
 
-        Btn(
+        self.refresh_btn = Btn(
             self.serial_config_header, "刷新", width=60, height=CONTROL_HEIGHT,
             command=self._refresh_ports,
-        ).grid(row=0, column=2, sticky="ns", padx=8)
+        )
+        grid_button(self.refresh_btn, row=0, column=2, sticky="ns")
 
         Label(
             self.serial_config_header, "波特率", width=50, height=CONTROL_HEIGHT,
@@ -305,27 +328,39 @@ class SerialApp(ctk.CTk):
             self.serial_config_header,
             values=COMMON_BAUD_RATES,
             width=140, height=CONTROL_HEIGHT, default=initial_baud,
+            command=self._on_serial_setting_changed,
         )
         self.baud_cb.grid(row=0, column=4, sticky="ns")
 
-        self.monitor_btn = Btn(
-            self.serial_config_header, "开始监控 ▶", color="blue",
-            width=110, height=CONTROL_HEIGHT, command=self._toggle_monitor,
+        # 右侧操作按钮容器（统一间距）
+        self.config_action_frame = ctk.CTkFrame(
+            self.serial_config_header,
+            fg_color="transparent",
+            corner_radius=0,
         )
-        self.monitor_btn.grid(row=0, column=6, sticky="nse")
-
-        self.collapse_button = Btn(
-            self.serial_config_header, "收起 ▲", color="red",
-            width=90, height=CONTROL_HEIGHT, command=self._toggle_cfg,
+        self.config_action_frame.grid(
+            row=0, column=6, columnspan=3, sticky="e",
         )
-        self.collapse_button.grid(row=0, column=7, sticky="nse", padx=(8, 0))
+        self.config_action_frame.grid_rowconfigure(0, weight=1)
 
         self.format_button = Btn(
-            self.serial_config_header, "HEX 格式", color="green",
+            self.config_action_frame, "HEX 格式", color="green",
             width=90, height=CONTROL_HEIGHT,
             command=self._toggle_display_format,
         )
-        self.format_button.grid(row=0, column=8, sticky="nse", padx=(8, 0))
+        grid_button(self.format_button, row=0, column=0, sticky="ns")
+
+        self.collapse_button = Btn(
+            self.config_action_frame, "收起 ▲", color="red",
+            width=90, height=CONTROL_HEIGHT, command=self._toggle_cfg,
+        )
+        grid_button(self.collapse_button, row=0, column=1, sticky="ns")
+
+        self.monitor_btn = Btn(
+            self.config_action_frame, "开始监控 ▶", color="blue",
+            width=110, height=CONTROL_HEIGHT, command=self._toggle_monitor,
+        )
+        grid_button(self.monitor_btn, row=0, column=2, sticky="ns")
 
         # ── Body (rows 2-3, collapsible) ──
         self.serial_config_body = ctk.CTkFrame(self.serial_config_card, fg_color="transparent")
@@ -341,13 +376,15 @@ class SerialApp(ctk.CTk):
 
         Label(r2, "数据位", width=50).pack(side="left", padx=(0, 8))
         self.data_bits_cb = ReadOnlyDropdown(
-            r2, values=["5", "6", "7", "8"], width=70, default="8"
+            r2, values=["5", "6", "7", "8"], width=70, default="8",
+            command=self._on_serial_setting_changed,
         )
         self.data_bits_cb.pack(side="left", padx=(0, 24))
 
         Label(r2, "停止位", width=50).pack(side="left", padx=(0, 8))
         self.stop_bits_cb = ReadOnlyDropdown(
-            r2, values=["1", "1.5", "2"], width=70, default="1"
+            r2, values=["1", "1.5", "2"], width=70, default="1",
+            command=self._on_serial_setting_changed,
         )
         self.stop_bits_cb.pack(side="left", padx=(0, 24))
 
@@ -368,7 +405,7 @@ class SerialApp(ctk.CTk):
 
         self.storage_btn = Btn(r3, "开始存储数据", color="blue", width=110, height=28,
                                 command=self._toggle_storage)
-        self.storage_btn.pack(side="left")
+        pack_button(self.storage_btn, side="left")
 
         Label(r3, "路径", width=50).pack(side="left", padx=(18, 8))
         self.path_entry = ctk.CTkEntry(
@@ -380,8 +417,9 @@ class SerialApp(ctk.CTk):
         )
         self.path_entry.pack(side="left", fill="x", expand=True)
 
-        Btn(r3, "选择", width=60, height=28,
-            command=self._choose_folder).pack(side="left", padx=(8, 0))
+        self.choose_folder_btn = Btn(r3, "选择", width=60, height=28,
+            command=self._choose_folder)
+        pack_button(self.choose_folder_btn, side="left")
 
     # ─────────────────────────────────────────────────────────────────
     # WORKSPACE  (main_area + send_panel，统一使用 grid)
@@ -464,25 +502,26 @@ class SerialApp(ctk.CTk):
             anchor="w",
         ).pack(side="left", pady=6)
 
-        # 协议解析模式按钮：初始绿底白字（协议解析模式）
+        # 协议解析模式按钮：初始白底黑字（协议解析模式默认关闭）
         self.btn_parse_mode = Btn(
-            tb, "协议解析模式", color="green",
+            tb, "协议解析模式", color="white",
             width=110, height=CONTROL_HEIGHT,
             command=self._toggle_parse_mode,
         )
-        self.btn_parse_mode.pack(side="left", padx=2, pady=6)
+        self.btn_parse_mode.pack(side="left", padx=BUTTON_PAD_X, pady=BUTTON_PAD_Y)
 
-        Btn(
+        self.clear_button = Btn(
             tb, "清空", width=60, height=CONTROL_HEIGHT,
             command=self._clear_rx,
-        ).pack(side="left", padx=2, pady=6)
+        )
+        pack_button(self.clear_button, side="left")
 
         self.btn_auto_scroll = Btn(
             tb, "自动滚动", color="green",
             width=80, height=CONTROL_HEIGHT,
             command=self._toggle_auto_scroll,
         )
-        self.btn_auto_scroll.pack(side="left", padx=2, pady=6)
+        pack_button(self.btn_auto_scroll, side="left")
 
         # 固定尺寸的协议控件槽位：无论内部内容是否显示，槽位尺寸都不变化
         self.protocol_controls_slot = ctk.CTkFrame(
@@ -515,7 +554,7 @@ class SerialApp(ctk.CTk):
             font=FONT_NORMAL,
             text_color="#374151",
             height=CONTROL_HEIGHT,
-        ).pack(side="left", padx=(0, 4))
+        ).pack(side="left", padx=(0, BUTTON_PAD_X))
 
         self.product_proto_combo = ReadOnlyDropdown(
             self.protocol_controls_frame,
@@ -523,25 +562,25 @@ class SerialApp(ctk.CTk):
             width=150, height=CONTROL_HEIGHT, default="串口3.0协议",
             command=self._on_protocol_selected,
         )
-        self.product_proto_combo.pack(side="left", padx=2)
+        self.product_proto_combo.pack(side="left", padx=BUTTON_PAD_X)
 
         self.import_protocol_btn = Btn(
             self.protocol_controls_frame, "导入Word协议",
             width=110, height=CONTROL_HEIGHT, command=self._import_word_protocol,
         )
-        self.import_protocol_btn.pack(side="left", padx=2)
+        pack_button(self.import_protocol_btn, side="left")
 
         self.view_protocol_btn = Btn(
             self.protocol_controls_frame, "查看协议",
             width=80, height=CONTROL_HEIGHT, command=self._view_current_protocol,
         )
-        self.view_protocol_btn.pack(side="left", padx=2)
+        pack_button(self.view_protocol_btn, side="left")
 
         self.btn_module_send = Btn(
             self.protocol_controls_frame, "模组发送", color="green",
             width=80, height=CONTROL_HEIGHT, command=self._module_send,
         )
-        self.btn_module_send.pack(side="left", padx=2)
+        pack_button(self.btn_module_send, side="left")
 
         # Big display area
         self.rxbox_frame = ctk.CTkFrame(self.receive, fg_color="#f8fafc", corner_radius=12)
@@ -591,11 +630,21 @@ class SerialApp(ctk.CTk):
             anchor="w"
         ).pack(side="left", padx=(12, 10), pady=8)
 
-        Btn(tb, "HEX", color="blue", width=50, height=28).pack(side="left", padx=3)
-        Btn(tb, "循环发送", width=70, height=28).pack(side="left", padx=3)
-        Btn(tb, "配置循环", width=70, height=28).pack(side="left", padx=3)
-        Btn(tb, "清空选中", width=70, height=28).pack(side="left", padx=3)
-        Btn(tb, "新增", width=50, height=28, command=self._add_command).pack(side="left", padx=3)
+        TOOLBAR_BUTTON_HEIGHT = 28
+        hex_tool_btn = Btn(tb, "HEX", color="blue", width=50, height=TOOLBAR_BUTTON_HEIGHT)
+        pack_button(hex_tool_btn, side="left")
+
+        loop_btn = Btn(tb, "循环发送", width=70, height=TOOLBAR_BUTTON_HEIGHT)
+        pack_button(loop_btn, side="left")
+
+        cfg_loop_btn = Btn(tb, "配置循环", width=70, height=TOOLBAR_BUTTON_HEIGHT)
+        pack_button(cfg_loop_btn, side="left")
+
+        clear_sel_btn = Btn(tb, "清空选中", width=70, height=TOOLBAR_BUTTON_HEIGHT)
+        pack_button(clear_sel_btn, side="left")
+
+        self.add_cmd_btn = Btn(tb, "新增", width=50, height=TOOLBAR_BUTTON_HEIGHT, command=self._add_command)
+        pack_button(self.add_cmd_btn, side="left")
 
         # Table
         table_frame = ctk.CTkFrame(self.library, fg_color="transparent")
@@ -657,13 +706,15 @@ class SerialApp(ctk.CTk):
 
         self.btn_send_mode_hex = Btn(left, "协议模式", color="blue", width=110, height=30,
                                      command=lambda: self._set_send_mode("protocol"))
-        self.btn_send_mode_hex.pack(anchor="w", pady=3)
+        pack_button(self.btn_send_mode_hex, side="top", anchor="w")
 
-        Btn(left, "HEX", width=110, height=30,
-            command=lambda: self._set_send_mode("hex")).pack(anchor="w", pady=3)
+        self.btn_send_mode_hex_mode = Btn(left, "HEX", width=110, height=30,
+            command=lambda: self._set_send_mode("hex"))
+        pack_button(self.btn_send_mode_hex_mode, side="top", anchor="w")
 
-        Btn(left, "ASCII", width=110, height=30,
-            command=lambda: self._set_send_mode("ascii")).pack(anchor="w", pady=3)
+        self.btn_send_mode_ascii = Btn(left, "ASCII", width=110, height=30,
+            command=lambda: self._set_send_mode("ascii"))
+        pack_button(self.btn_send_mode_ascii, side="top", anchor="w")
 
     def _build_send_middle(self, parent):
         center = ctk.CTkFrame(parent, fg_color="transparent")
@@ -741,17 +792,23 @@ class SerialApp(ctk.CTk):
 
         # Row 1: 发送 / 清空 / 加回车
         r1 = ctk.CTkFrame(right, fg_color="transparent")
-        r1.pack(fill="x", pady=3)
-        Btn(r1, "发送", color="blue", width=70, height=30,
-            command=self._send_data).pack(side="left", padx=(0, 4))
-        Btn(r1, "清空输入", width=80, height=30,
-            command=self._clear_input).pack(side="left", padx=4)
-        Btn(r1, "加回车换行", width=90, height=30).pack(side="left", padx=(4, 0))
+        r1.pack(fill="x", pady=BUTTON_PAD_Y)
+        self.send_btn = Btn(r1, "发送", color="blue", width=70, height=30,
+            command=self._send_data)
+        pack_button(self.send_btn, side="left")
+
+        self.clear_input_btn = Btn(r1, "清空输入", width=80, height=30,
+            command=self._clear_input)
+        pack_button(self.clear_input_btn, side="left")
+
+        self.add_cr_btn = Btn(r1, "加回车换行", width=90, height=30)
+        pack_button(self.add_cr_btn, side="left")
 
         # Row 2: 校验位
         r2 = ctk.CTkFrame(right, fg_color="transparent")
-        r2.pack(fill="x", pady=8)
-        Btn(r2, "自动追加校验位", width=110, height=28).pack(side="left", padx=(0, 4))
+        r2.pack(fill="x", pady=BUTTON_PAD_Y)
+        self.add_checksum_btn = Btn(r2, "自动追加校验位", width=110, height=28)
+        pack_button(self.add_checksum_btn, side="left")
         self.add8_cb = ReadOnlyDropdown(
             r2, values=["ADD8", "CRC16", "XOR"],
             width=90, default="ADD8"
@@ -760,8 +817,9 @@ class SerialApp(ctk.CTk):
 
         # Row 3: 自动发送
         r3 = ctk.CTkFrame(right, fg_color="transparent")
-        r3.pack(fill="x", pady=3)
-        Btn(r3, "自动发送", width=70, height=28).pack(side="left", padx=(0, 4))
+        r3.pack(fill="x", pady=BUTTON_PAD_Y)
+        self.auto_send_btn = Btn(r3, "自动发送", width=70, height=28)
+        pack_button(self.auto_send_btn, side="left")
 
         ctk.CTkLabel(r3, text="间隔(ms)", font=ctk.CTkFont(size=13),
                      text_color="#374151").pack(side="left", padx=4)
@@ -913,6 +971,264 @@ class SerialApp(ctk.CTk):
             self.config_expanded = True
         self.update_idletasks()
 
+    def _get_serial_config_from_ui(self):
+        selected_display = self.com_port.get().strip()
+
+        port = self.port_display_map.get(
+            selected_display,
+            "",
+        )
+
+        if not port:
+            raise ValueError("请选择有效串口")
+
+        if hasattr(self.baud_cb, "get_valid_baud"):
+            baudrate = self.baud_cb.get_valid_baud()
+        else:
+            baudrate = int(self.baud_cb.get())
+
+        data_bits = int(self.data_bits_cb.get())
+        stop_bits = float(self.stop_bits_cb.get())
+
+        if data_bits not in (5, 6, 7, 8):
+            raise ValueError("数据位必须为 5、6、7 或 8")
+
+        if stop_bits not in (1.0, 1.5, 2.0):
+            raise ValueError("停止位必须为 1、1.5 或 2")
+
+        return {
+            "port": port,
+            "port_display": selected_display,
+            "baudrate": baudrate,
+            "data_bits": data_bits,
+            "stop_bits": stop_bits,
+        }
+
+    def _restore_serial_config_to_ui(self, config):
+        display_name = None
+
+        for name, device in self.port_display_map.items():
+            if device == config["port"]:
+                display_name = name
+                break
+
+        if display_name:
+            self.com_port.set(display_name)
+
+        self.baud_cb.set(str(config["baudrate"]))
+        self.data_bits_cb.set(str(config["data_bits"]))
+
+        stop_bits = config["stop_bits"]
+        if stop_bits == 1.0:
+            stop_text = "1"
+        elif stop_bits == 2.0:
+            stop_text = "2"
+        else:
+            stop_text = "1.5"
+
+        self.stop_bits_cb.set(stop_text)
+
+    def _on_serial_setting_changed(self, value=None):
+        # 没有监控时只修改界面，不连接串口
+        if not self.monitoring:
+            return
+
+        # 正在重连时记录还有新配置待处理
+        if self.serial_reconfiguring:
+            self._reconfigure_pending = True
+            return
+
+        # 用户短时间连续选择时，只执行最后一次
+        if self._reconfigure_after_id is not None:
+            try:
+                self.after_cancel(self._reconfigure_after_id)
+            except Exception:
+                pass
+
+        self._reconfigure_after_id = self.after(
+            250,
+            self._begin_live_serial_reconfigure,
+        )
+
+    def _begin_live_serial_reconfigure(self):
+        self._reconfigure_after_id = None
+
+        if not self.monitoring:
+            return
+
+        if self.serial_reconfiguring:
+            self._reconfigure_pending = True
+            return
+
+        try:
+            new_config = self._get_serial_config_from_ui()
+        except ValueError as error:
+            messagebox.showwarning(
+                "串口参数错误",
+                str(error),
+                parent=self,
+            )
+            return
+
+        # 参数实际没有变化时不重新连接
+        if new_config == self.active_serial_config:
+            return
+
+        old_config = (
+            dict(self.active_serial_config)
+            if self.active_serial_config
+            else None
+        )
+
+        self.serial_reconfiguring = True
+        self._reconfigure_pending = False
+        self._serial_config_generation += 1
+
+        generation = self._serial_config_generation
+
+        # 切换期间禁止旧串口数据进入显示区
+        self.monitor_btn.configure(
+            text="正在切换...",
+            state="disabled",
+            fg_color="#9CA3AF",
+            hover_color="#9CA3AF",
+            border_color="#9CA3AF",
+        )
+
+        def reconfigure_worker():
+            error = None
+            rollback_ok = False
+
+            try:
+                self.worker.reconnect(
+                    port=new_config["port"],
+                    baudrate=new_config["baudrate"],
+                    data_bits=new_config["data_bits"],
+                    stop_bits=new_config["stop_bits"],
+                    timeout=2.0,
+                )
+
+            except Exception as new_error:
+                error = new_error
+
+                # 新配置失败时尝试恢复旧配置
+                if old_config is not None:
+                    try:
+                        self.worker.reconnect(
+                            port=old_config["port"],
+                            baudrate=old_config["baudrate"],
+                            data_bits=old_config["data_bits"],
+                            stop_bits=old_config["stop_bits"],
+                            timeout=2.0,
+                        )
+                        rollback_ok = True
+                    except Exception:
+                        rollback_ok = False
+
+            self.after(
+                0,
+                self._finish_live_serial_reconfigure,
+                generation,
+                new_config,
+                old_config,
+                error,
+                rollback_ok,
+            )
+
+        threading.Thread(
+            target=reconfigure_worker,
+            daemon=True,
+            name="serial-live-reconfigure",
+        ).start()
+
+    def _finish_live_serial_reconfigure(
+        self,
+        generation,
+        new_config,
+        old_config,
+        error,
+        rollback_ok,
+    ):
+        # 旧任务不能覆盖后续新任务
+        if generation != self._serial_config_generation:
+            return
+
+        self.serial_reconfiguring = False
+
+        if error is None:
+            self.active_serial_config = dict(new_config)
+
+            self.lbl_com.configure(text=new_config["port"])
+            self.lbl_baud.configure(text=str(new_config["baudrate"]))
+
+            self.monitor_btn.configure(
+                text="停止监控 ■",
+                state="normal",
+                fg_color=RED,
+                hover_color="#EF4444",
+                border_color=RED,
+                text_color="#FFFFFF",
+            )
+
+        elif rollback_ok and old_config is not None:
+            self.active_serial_config = dict(old_config)
+
+            # 界面恢复到旧的有效参数
+            self._restore_serial_config_to_ui(old_config)
+
+            self.monitor_btn.configure(
+                text="停止监控 ■",
+                state="normal",
+                fg_color=RED,
+                hover_color="#EF4444",
+                border_color=RED,
+                text_color="#FFFFFF",
+            )
+
+            messagebox.showwarning(
+                "串口切换失败",
+                (
+                    f"无法应用新的串口设置：\n{error}\n\n"
+                    "已恢复到原串口设置。"
+                ),
+                parent=self,
+            )
+
+        else:
+            self.monitoring = False
+            self.active_serial_config = None
+
+            try:
+                self.worker.disconnect(wait=True, timeout=2.0)
+            except Exception:
+                pass
+
+            self.monitor_btn.configure(
+                text="开始监控 ▶",
+                state="normal",
+                fg_color=BLUE,
+                hover_color="#4096FF",
+                border_color=BLUE,
+                text_color="#FFFFFF",
+            )
+
+            messagebox.showerror(
+                "串口连接失败",
+                (
+                    f"无法应用新的串口设置：\n{error}\n\n"
+                    "原串口连接也无法恢复，监控已停止。"
+                ),
+                parent=self,
+            )
+
+        # 切换过程中用户又改了参数，继续应用最新值
+        if self.monitoring and self._reconfigure_pending:
+            self._reconfigure_pending = False
+            self._reconfigure_after_id = self.after(
+                100,
+                self._begin_live_serial_reconfigure,
+            )
+
     def _toggle_monitor(self):
         if self.monitor_stopping:
             return
@@ -923,31 +1239,14 @@ class SerialApp(ctk.CTk):
             self._start_monitoring()
 
     def _start_monitoring(self):
-        selected_display = self.com_port.get()
-
-        port = self.port_display_map.get(
-            selected_display,
-            "",
-        )
-
-        if not port:
-            messagebox.showwarning(
-                "串口错误",
-                "请选择有效串口。",
-                parent=self,
-            )
-            return
-
         try:
-            if hasattr(self.baud_cb, "get_valid_baud"):
-                baud = self.baud_cb.get_valid_baud()
-            else:
-                baud = int(self.baud_cb.get())
+            config = self._get_serial_config_from_ui()
+            port = config["port"]
+            baud = config["baudrate"]
+            data_bits = config["data_bits"]
+            stop_bits = config["stop_bits"]
 
-            data_bits = int(self.data_bits_cb.get())
-            stop_bits = float(self.stop_bits_cb.get())
-
-        except (TypeError, ValueError) as error:
+        except ValueError as error:
             messagebox.showwarning(
                 "串口参数错误",
                 str(error),
@@ -992,6 +1291,7 @@ class SerialApp(ctk.CTk):
 
         self.monitoring = True
         self.monitor_stopping = False
+        self._reconfigure_pending = False
 
         self.monitor_btn.configure(
             text="停止监控 ■",
@@ -1004,6 +1304,7 @@ class SerialApp(ctk.CTk):
 
         self.lbl_com.configure(text=port)
         self.lbl_baud.configure(text=str(baud))
+        self.active_serial_config = dict(config)
 
     def _stop_monitoring(self):
         if self.monitor_stopping:
@@ -1047,6 +1348,16 @@ class SerialApp(ctk.CTk):
     def _finish_stop_monitoring(self, stop_error=None):
         self.monitoring = False
         self.monitor_stopping = False
+        self.serial_reconfiguring = False
+        self._reconfigure_pending = False
+        self.active_serial_config = None
+
+        if self._reconfigure_after_id is not None:
+            try:
+                self.after_cancel(self._reconfigure_after_id)
+            except Exception:
+                pass
+            self._reconfigure_after_id = None
 
         self.monitor_btn.configure(
             text="开始监控 ▶",
@@ -1076,6 +1387,16 @@ class SerialApp(ctk.CTk):
 
         self.monitoring = False
         self.monitor_stopping = False
+        self.serial_reconfiguring = False
+        self._reconfigure_pending = False
+        self.active_serial_config = None
+
+        if self._reconfigure_after_id is not None:
+            try:
+                self.after_cancel(self._reconfigure_after_id)
+            except Exception:
+                pass
+            self._reconfigure_after_id = None
 
         self.monitor_btn.configure(
             text="开始监控 ▶",
@@ -1099,19 +1420,34 @@ class SerialApp(ctk.CTk):
         return self._format_ascii_data(data)
 
     @staticmethod
+    def _format_timestamp(timestamp):
+        dt = datetime.fromtimestamp(timestamp)
+        return dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+    def _format_rx_record(self, data, timestamp, direction="RX"):
+        time_text = self._format_timestamp(timestamp)
+
+        if self.display_mode == "hex":
+            payload_text = data.hex(" ").upper()
+        else:
+            payload_text = self._format_ascii_data(data)
+
+        return f"[{time_text}] {direction}  {payload_text}"
+
+    @staticmethod
     def _format_ascii_data(data):
         chars = []
         for byte in data:
             if byte == 13:
                 chars.append("\\r")
             elif byte == 10:
-                chars.append("\\n\n")
+                chars.append("\\n")
             elif byte == 9:
                 chars.append("\\t")
             elif 32 <= byte <= 126:
                 chars.append(chr(byte))
             else:
-                chars.append(".")
+                chars.append(f"\\x{byte:02X}")
         return "".join(chars)
 
     def _append_rx(self, data):
@@ -1128,6 +1464,27 @@ class SerialApp(ctk.CTk):
         if self.auto_scroll:
             self.rxbox.see("end")
 
+    def _append_rx_record(self, record):
+        self.rx_placeholder.place_forget()
+
+        self.rxbox.place(
+            relx=0,
+            rely=0,
+            relwidth=1,
+            relheight=1,
+        )
+
+        text = self._format_rx_record(
+            data=record["data"],
+            timestamp=record["timestamp"],
+            direction=record.get("direction", "RX"),
+        )
+
+        self.rxbox.insert("end", text + "\n")
+
+        if self.auto_scroll:
+            self.rxbox.see("end")
+
     def _toggle_display_format(self):
         if self.display_mode == "hex":
             self.display_mode = "ascii"
@@ -1135,9 +1492,9 @@ class SerialApp(ctk.CTk):
 
             self.format_button.configure(
                 text="ASCII 格式",
-                fg_color=GREEN,
-                hover_color="#22c55e",
-                border_color=GREEN,
+                fg_color=RED,
+                hover_color="#EF4444",
+                border_color=RED,
                 text_color="#FFFFFF",
             )
 
@@ -1145,6 +1502,7 @@ class SerialApp(ctk.CTk):
                 font=ctk.CTkFont(
                     family="Microsoft YaHei UI",
                     size=12,
+                    weight="bold",
                 ),
                 wrap="char",
             )
@@ -1156,7 +1514,7 @@ class SerialApp(ctk.CTk):
             self.format_button.configure(
                 text="HEX 格式",
                 fg_color=GREEN,
-                hover_color="#22c55e",
+                hover_color="#22C55E",
                 border_color=GREEN,
                 text_color="#FFFFFF",
             )
@@ -1165,6 +1523,7 @@ class SerialApp(ctk.CTk):
                 font=ctk.CTkFont(
                     family="Consolas",
                     size=12,
+                    weight="bold",
                 ),
                 wrap="none",
             )
@@ -1184,7 +1543,6 @@ class SerialApp(ctk.CTk):
             return
 
         self.rx_placeholder.place_forget()
-
         self.rxbox.place(
             relx=0,
             rely=0,
@@ -1192,8 +1550,12 @@ class SerialApp(ctk.CTk):
             relheight=1,
         )
 
-        for data in self.rx_history:
-            text = self._format_rx_data(data)
+        for record in self.rx_history:
+            text = self._format_rx_record(
+                data=record["data"],
+                timestamp=record["timestamp"],
+                direction=record.get("direction", "RX"),
+            )
             self.rxbox.insert("end", text + "\n")
 
         if self.auto_scroll:
@@ -1241,11 +1603,11 @@ class SerialApp(ctk.CTk):
             )
             self.lbl_storage.configure(text="未存储", text_color="#6b7280")
 
-    def _toggle_parse_mode(self):
-        self.parse_mode = not self.parse_mode
+    def _set_parse_mode(self, enabled):
+        enabled = bool(enabled)
+        self.parse_mode = enabled
 
-        if self.parse_mode:
-            # 协议解析模式：绿底白字
+        if enabled:
             self.btn_parse_mode.configure(
                 fg_color=GREEN,
                 hover_color="#22c55e",
@@ -1253,15 +1615,8 @@ class SerialApp(ctk.CTk):
                 border_color=GREEN,
                 border_width=1,
             )
-
-            # 恢复协议控件，但外层槽位尺寸始终不变
-            self.protocol_controls_frame.place(
-                x=0,
-                y=0,
-            )
-
+            self.protocol_controls_frame.place(x=0, y=0)
         else:
-            # 原始数据模式：白底黑字
             self.btn_parse_mode.configure(
                 fg_color="#FFFFFF",
                 hover_color="#F3F4F6",
@@ -1269,11 +1624,12 @@ class SerialApp(ctk.CTk):
                 border_color="#D1D5DB",
                 border_width=1,
             )
-
-            # 只隐藏内部控件，不隐藏固定槽位
             self.protocol_controls_frame.place_forget()
 
         self.update_idletasks()
+
+    def _toggle_parse_mode(self):
+        self._set_parse_mode(not self.parse_mode)
 
     def _toggle_auto_scroll(self):
         self.auto_scroll = not self.auto_scroll
@@ -1506,52 +1862,58 @@ class SerialApp(ctk.CTk):
         self.btn_send_mode_hex.configure(fg_color=BLUE, text_color="white",
                                          border_width=0)
 
-    def _on_serial_data(self, data):
+    def _on_serial_data(self, data, received_at=None):
         """串口回调线程：第一层状态检查 + 入队原始数据 + 转发到 UI 线程。"""
-        if not self.monitoring:
+        if not self.monitoring or self.serial_reconfiguring:
             return
 
         raw_data = bytes(data)
-        timestamp = time.time()
+        if received_at is None:
+            received_at = time.time()
 
         # 原始数据实时落盘（在工作线程中执行，不阻塞串口接收）
         if self.raw_saver.active:
-            self.raw_saver.enqueue_rx(raw_data, timestamp)
+            self.raw_saver.enqueue_rx(raw_data, received_at)
 
         # 转发到 UI 线程处理（第二层检查在 _append_rx_if_monitoring）
         self.after(
             0,
             self._append_rx_if_monitoring,
             raw_data,
-            timestamp,
+            received_at,
         )
 
-    def _append_rx_if_monitoring(self, data, timestamp):
+    def _append_rx_if_monitoring(self, data, received_at):
         """UI 线程：第二层状态检查，通过后保存历史并显示。"""
-        if not self.monitoring:
+        if not self.monitoring or self.serial_reconfiguring:
             return
 
-        self.rx_history.append(data)
-        self._process_received_data(data, timestamp)
+        record = {
+            "timestamp": received_at,
+            "direction": "RX",
+            "data": bytes(data),
+        }
+        self.rx_history.append(record)
+        self._process_received_data(record)
 
-    def _process_received_data(self, data, timestamp):
+    def _process_received_data(self, record):
         """UI 线程：根据模式分流处理接收数据。"""
         self.rx_placeholder.place_forget()
         self.rxbox.place(relx=0, rely=0, relwidth=1, relheight=1)
 
-        if not self.parse_mode:
-            # 原始数据模式：使用统一格式化函数
-            text = self._format_rx_data(data)
-            self.rxbox.insert("end", text + "\n")
-        else:
-            # 协议解析模式：帧同步 → parse_frame → 显示解析结果
-            self._process_protocol_data(data, timestamp)
+        raw_data = record["data"]
+        received_at = record["timestamp"]
 
-        if self.auto_scroll:
-            self.rxbox.see("end")
+        if not self.parse_mode:
+            self._append_rx_record(record)
+        else:
+            self._process_protocol_data(raw_data, received_at)
 
     def _process_protocol_data(self, data, timestamp):
         """协议模式：通过 FrameSynchronizer 切帧后逐帧解析。"""
+        if not self.monitoring or self.serial_reconfiguring:
+            return
+
         if not self.monitoring:
             return
 
@@ -1560,19 +1922,17 @@ class SerialApp(ctk.CTk):
             return
 
         try:
+            frame_completed_ts = timestamp
             frames = self.frame_synchronizer.feed(data)
 
             if not frames:
-                # 半帧等待中，不显示
                 return
 
             for frame in frames:
                 try:
                     result = self.protocol_manager.parse_frame(frame.raw)
-                    text = self._format_parse_result(result, timestamp)
-                    self.rxbox.insert("end", text + "\n")
+                    self._display_parse_result(result, frame, frame_completed_ts)
 
-                    # 结构化日志
                     if self.result_logger:
                         try:
                             self.result_logger.log(result, timestamp)
@@ -1592,43 +1952,37 @@ class SerialApp(ctk.CTk):
                 f"[{self._fmt_ts(timestamp)}] [RX] 解析异常: {error}\n",
             )
 
-    def _format_parse_result(self, result, timestamp):
-        """格式化 ParseResult 为可读字符串。"""
-        ts = self._fmt_ts(timestamp)
-        checksum_str = "✓" if result.checksum_ok else ("✗" if result.checksum_ok is False else "?")
-        cmd = result.cmd_code or "??"
-        name = result.cmd_name or "未知"
-        direction = result.direction or ""
-
-        lines = [f"[{ts}] RX  {name}  CMD={cmd}  Checksum={checksum_str}  {direction}"]
-
-        # 解析字段
-        for field in result.fields:
-            if isinstance(field, dict):
-                if field.get("type") == "separator":
-                    continue
-                fname = field.get("name", "")
-                fval = field.get("text", field.get("value", ""))
-                lines.append(f"  {fname} = {fval}")
-
-        if result.error:
-            lines.append(f"  ⚠ {result.error}")
-
-        return "\n".join(lines)
+    def _display_parse_result(self, result, frame, timestamp):
+        time_text = self._format_timestamp(timestamp)
+        checksum_text = "✓" if result.checksum_ok else "✗"
+        line = (
+            f"[{time_text}] RX  "
+            f"{result.cmd_name}  "
+            f"CMD=0x{result.cmd:02X}  "
+            f"Checksum={checksum_text}"
+        )
+        self.rxbox.insert("end", line + "\n")
+        if self.auto_scroll:
+            self.rxbox.see("end")
 
     @staticmethod
     def _fmt_ts(ts):
         """格式化时间戳为 HH:MM:SS.fff。"""
-        import datetime
-        dt = datetime.datetime.fromtimestamp(ts)
+        dt = datetime.fromtimestamp(ts)
         return dt.strftime("%H:%M:%S.") + f"{int(dt.microsecond / 1000):03d}"
 
-    def _on_tx_sent(self, data, timestamp):
-        """发送成功后回调：入队 TX 数据 + 更新 UI。"""
-        if self.raw_saver.active:
-            self.raw_saver.enqueue_tx(data, timestamp)
+    def _on_tx_sent(self, data, sent_at=None):
+        if sent_at is None:
+            sent_at = time.time()
 
-        self.after(0, self._update_tx_status, len(data))
+        record = {
+            "timestamp": sent_at,
+            "direction": "TX",
+            "data": bytes(data),
+        }
+
+        self.rx_history.append(record)
+        self.after(0, self._append_rx_record, record)
 
     def _update_tx_status(self, length):
         """UI 线程：更新 TX 计数。"""

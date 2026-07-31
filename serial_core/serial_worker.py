@@ -1,6 +1,7 @@
 
 import re
 import threading
+import time
 
 try:
     import serial
@@ -109,6 +110,7 @@ class SerialWorker:
         self._read_thread = None
         self._stop_event = threading.Event()
         self._lock = threading.RLock()
+        self._operation_lock = threading.RLock()
 
     @property
     def is_connected(self):
@@ -198,46 +200,57 @@ class SerialWorker:
         if not serial:
             raise RuntimeError("请安装 pyserial")
 
-        # 防止重复启动两个读取线程
-        self.disconnect(wait=True, timeout=1.0)
+        with self._operation_lock:
+            # 防止重复启动两个读取线程
+            self.disconnect(wait=True, timeout=1.0)
 
-        bytesize_map = {
-            5: serial.FIVEBITS,
-            6: serial.SIXBITS,
-            7: serial.SEVENBITS,
-            8: serial.EIGHTBITS,
-        }
+            bytesize_map = {
+                5: serial.FIVEBITS,
+                6: serial.SIXBITS,
+                7: serial.SEVENBITS,
+                8: serial.EIGHTBITS,
+            }
 
-        stopbits_map = {
-            1.0: serial.STOPBITS_ONE,
-            1.5: serial.STOPBITS_ONE_POINT_FIVE,
-            2.0: serial.STOPBITS_TWO,
-        }
+            stopbits_map = {
+                1.0: serial.STOPBITS_ONE,
+                1.5: serial.STOPBITS_ONE_POINT_FIVE,
+                2.0: serial.STOPBITS_TWO,
+            }
 
-        with self._lock:
-            self._stop_event.clear()
+            with self._lock:
+                self._stop_event.clear()
 
-            self._serial = serial.Serial(
+                self._serial = serial.Serial(
+                    port=port,
+                    baudrate=int(baudrate),
+                    bytesize=bytesize_map.get(
+                        int(data_bits),
+                        serial.EIGHTBITS,
+                    ),
+                    stopbits=stopbits_map.get(
+                        float(stop_bits),
+                        serial.STOPBITS_ONE,
+                    ),
+                    timeout=0.1,
+                    write_timeout=1.0,
+                )
+
+                self._read_thread = threading.Thread(
+                    target=self._read_loop,
+                    daemon=True,
+                    name=f"serial-reader-{port}",
+                )
+                self._read_thread.start()
+
+    def reconnect(self, port, baudrate=9600, data_bits=8, stop_bits=1, timeout=2.0):
+        with self._operation_lock:
+            self.disconnect(wait=True, timeout=timeout)
+            self.connect(
                 port=port,
-                baudrate=int(baudrate),
-                bytesize=bytesize_map.get(
-                    int(data_bits),
-                    serial.EIGHTBITS,
-                ),
-                stopbits=stopbits_map.get(
-                    float(stop_bits),
-                    serial.STOPBITS_ONE,
-                ),
-                timeout=0.1,
-                write_timeout=1.0,
+                baudrate=baudrate,
+                data_bits=data_bits,
+                stop_bits=stop_bits,
             )
-
-            self._read_thread = threading.Thread(
-                target=self._read_loop,
-                daemon=True,
-                name=f"serial-reader-{port}",
-            )
-            self._read_thread.start()
 
     def _read_loop(self):
         while not self._stop_event.is_set():
@@ -249,16 +262,39 @@ class SerialWorker:
                     break
 
                 waiting = ser.in_waiting
+
                 data = ser.read(
                     waiting if waiting > 0 else 1
                 )
+
+                if data and not self._stop_event.is_set():
+                    # 短暂聚合后续字节，避免每个字节单独一行
+                    time.sleep(0.002)
+
+                    more = ser.in_waiting
+
+                    if more > 0:
+                        data += ser.read(more)
 
                 if (
                     data
                     and not self._stop_event.is_set()
                     and self.callback is not None
                 ):
-                    self.callback(data)
+                    # 数据实际到达时生成时间戳（完整帧后才取当前系统时间
+                    received_at = time.time()
+
+                    try:
+                        self.callback(
+                            bytes(data),
+                            received_at,
+                        )
+                    except TypeError:
+                        # 兼容仅接受 data 1 个参数的旧回调签名
+                        try:
+                            self.callback(bytes(data))
+                        except Exception:
+                            pass
 
             except (serial.SerialException, OSError) as error:
                 # 用户主动停止时，close 导致的异常不需要报告
@@ -277,13 +313,14 @@ class SerialWorker:
         return 0
 
     def disconnect(self, wait=True, timeout=2.0):
-        self._stop_event.set()
+        with self._operation_lock:
+            self._stop_event.set()
 
-        with self._lock:
-            ser = self._serial
-            thread = self._read_thread
-            self._serial = None
-            self._read_thread = None
+            with self._lock:
+                ser = self._serial
+                thread = self._read_thread
+                self._serial = None
+                self._read_thread = None
 
         if ser is not None:
             try:
