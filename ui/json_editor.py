@@ -1,60 +1,45 @@
-"""
-JSON editor widget for editing a command payload.
-Features:
-* QPlainTextEdit with a 300 ms debounce timer.
-* Validates JSON on each debounce; if invalid, displays error in a status label.
-* Exposes `get_payload()` returning a dict or None.
-"""
-
 import json
 from PySide6.QtCore import QTimer
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QPlainTextEdit, QLabel
+from PySide6.QtWidgets import QWidget, QVBoxLayout
+from qfluentwidgets import PlainTextEdit, InfoBar
 
 class JsonEditor(QWidget):
+    """A JSON editor with 300 ms debounce validation.
+    The editor validates the JSON content after the user stops typing for 300 ms
+    and shows an InfoBar with success or error information.
+    """
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._payload: dict | None = None
+        self._init_ui()
+        self._debounce_timer = QTimer(self)
+        self._debounce_timer.setInterval(300)
+        self._debounce_timer.setSingleShot(True)
+        self._debounce_timer.timeout.connect(self._validate_json)
+
+    def _init_ui(self):
         layout = QVBoxLayout(self)
-        self.editor = QPlainTextEdit()
-        self.editor.setPlaceholderText("Edit JSON payload here…")
-        self.status = QLabel()
-        self.status.setStyleSheet("color: red")
-        layout.addWidget(self.editor, 1)
-        layout.addWidget(self.status)
-        # Debounce timer – 300 ms after user stops typing
-        self._timer = QTimer(self)
-        self._timer.setInterval(300)
-        self._timer.setSingleShot(True)
-        self.editor.textChanged.connect(self._timer.start)
-        self._timer.timeout.connect(self._validate)
+        self.editor = PlainTextEdit()
+        self.editor.textChanged.connect(self._on_text_changed)
+        layout.addWidget(self.editor)
 
-    def _validate(self):
-        text = self.editor.toPlainText().strip()
-        if not text:
-            self._payload = None
-            self.status.setText("")
-            return
+    def _on_text_changed(self):
+        # Restart debounce timer on each change
+        self._debounce_timer.start()
+
+    def _validate_json(self):
+        text = self.editor.toPlainText()
         try:
-            self._payload = json.loads(text)
-            self.status.setText("Valid JSON")
-            self.status.setStyleSheet("color: green")
-        except Exception as e:
-            self._payload = None
-            self.status.setText(f"Invalid JSON: {e}")
-            self.status.setStyleSheet("color: red")
-
-    def set_payload(self, payload: dict | None):
-        """Load a dict into the editor (pretty‑printed)."""
-        if payload is None:
-            self.editor.clear()
-            self._payload = None
-            self.status.setText("")
-        else:
-            txt = json.dumps(payload, ensure_ascii=False, indent=2)
-            self.editor.setPlainText(txt)
-            self._payload = payload
-            self.status.setText("Valid JSON")
-            self.status.setStyleSheet("color: green")
-
-    def get_payload(self) -> dict | None:
-        return self._payload
+            json.loads(text)
+            InfoBar.success(
+                title="Valid JSON",
+                content="The JSON is syntactically correct.",
+                duration=1500,
+                parent=self,
+            )
+        except json.JSONDecodeError as exc:
+            InfoBar.error(
+                title="Invalid JSON",
+                content=str(exc),
+                duration=3000,
+                parent=self,
+            )
