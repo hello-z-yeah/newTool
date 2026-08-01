@@ -34,8 +34,7 @@ from protocol_parser import (
 )
 
 # UI components
-from ui.main_window import MainWindow
-
+# NOTE: MainWindow is imported lazily inside main() after QApplication is created
 
 def load_protocol_cfg() -> dict:
     """Load the user‑provided protocol JSON (if any) and merge it with the built‑in V3.0."""
@@ -53,6 +52,8 @@ def load_protocol_cfg() -> dict:
 def main() -> int:
     """Standard Qt entry point."""
     app = QApplication(sys.argv)
+    # Import MainWindow after QApplication is instantiated to avoid QWidget before QApplication errors
+    from ui.main_window import MainWindow
     cfg = load_protocol_cfg()
     win = MainWindow(protocol_cfg=cfg)
     win.show()
