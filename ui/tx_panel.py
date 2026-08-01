@@ -1,8 +1,3 @@
-"""
-TX panel – send HEX data over the opened SerialCollector.
-Provides a QLineEdit for HEX input, a Send button, and a counter label.
-"""
-
 from PySide6.QtWidgets import QWidget, QHBoxLayout, QLineEdit, QPushButton, QLabel
 from qfluentwidgets import SwitchButton
 from protocol_parser.serial_collector import SerialCollector
@@ -34,7 +29,6 @@ class TxPanel(QWidget):
         if not text:
             return
         try:
-            # Reuse the parser from protocol_parser for consistency
             from protocol_parser import parse_hex_input
             data = parse_hex_input(text)
             self.collector.send(data)
