@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
 )
 
 from .theme import (
+    APP_BUTTON_HEIGHT,
     BORDER,
     BUTTON_HEIGHT,
     BUTTON_HOVER_SHADOW_BLUR,
@@ -44,6 +45,8 @@ from .theme import (
     CARD_BG,
     CMDLIB_ACTION_PAD_X,
     CMDLIB_ACTION_PAD_Y,
+    CMDLIB_SEND_BUTTON_WIDTH,
+    CMDLIB_ROW_HEIGHT,
     CMDLIB_ROW_MIN_HEIGHT,
     COMBO_POPUP_QSS,
     COMBOBOX_QSS,
@@ -64,6 +67,23 @@ from .theme import (
     TEXT,
     UI_FONT_FAMILY,
 )
+
+
+# ui.components 不直接依赖业务逻辑；CommandLibraryStore 仅用于 normalize_mode
+# （与 app.py 共用同一套合法 mode 校验）。
+# 放 import 在主题之后，避免跨模块循环引用。
+try:
+    from ..core.command_library import CommandLibraryStore  # noqa: E402
+except Exception:  # pragma: no cover - 仅作为直接单测 / 导入失败兜底
+    class _FallbackStore:  # type: ignore[override]
+        MODES = ("hex", "ascii")
+
+        @staticmethod
+        def normalize_mode(mode: str) -> str:
+            value = str(mode or "").strip().lower()
+            return value if value in _FallbackStore.MODES else "hex"
+
+    CommandLibraryStore = _FallbackStore
 
 
 @contextmanager
@@ -325,6 +345,7 @@ class UnifiedComboBox(QComboBox):
     * 右侧箭头区域与主体同背景，绝不割裂；
     * 鼠标悬停任意选项时，发出 ``optionHovered(status_name, full_text)``
       信号给主窗口状态栏做预览；
+    * 鼠标悬停本体时也发出当前选中项的状态栏预览；
     * 列表关闭后立即清除焦点蓝框；
     * 保留 Qt 原生箭头，颜色由 :class:`GrayComboArrowStyle` 调成灰色。
     """
@@ -368,9 +389,52 @@ class UnifiedComboBox(QComboBox):
         view.viewport().installEventFilter(self)
         self._QModelIndex = QModelIndex
 
+        # 本体悬停时：当前选项变化 -> 刷新状态栏显示
+        self.currentIndexChanged.connect(self._refresh_hover_status)
+
     # ------------------------------------------------------------------
     # Hover preview (status-bar integration)
     # ------------------------------------------------------------------
+    def _current_full_text(self) -> str:
+        """获取当前选中项的完整内容（用于本体悬停提示）。"""
+        index = self.currentIndex()
+        if index >= 0:
+            full_text = self.itemData(index, Qt.ItemDataRole.ToolTipRole)
+            if full_text:
+                return str(full_text).strip()
+        return str(self.currentText() or "").strip()
+
+    def _refresh_hover_status(self) -> None:
+        """当前选中项变化且鼠标仍在本体上时，刷新状态栏显示。"""
+        if not self.underMouse():
+            return
+        full_text = self._current_full_text()
+        if full_text:
+            self.optionHovered.emit(self._status_name, full_text)
+
+    def _apply_hover_glow(self) -> None:
+        """本体悬停时的视觉处理（当前由 QSS :hover 负责，保留钩子）。"""
+        self.update()
+
+    def _apply_normal_glow(self) -> None:
+        """本体离开时的视觉处理（当前由 QSS 负责，保留钩子）。"""
+        self.update()
+
+    def enterEvent(self, event) -> None:  # noqa: N802 - Qt API
+        self._apply_hover_glow()
+        full_text = self._current_full_text()
+        if full_text:
+            self.optionHovered.emit(self._status_name, full_text)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:  # noqa: N802 - Qt API
+        # 列表打开时，鼠标会从本体移动到弹出列表，
+        # 此时不要提前清除状态栏提示。
+        if not bool(self.property("popupOpen")):
+            self.optionHoverCleared.emit()
+            self._apply_normal_glow()
+        super().leaveEvent(event)
+
     def _on_option_hovered(self, index) -> None:
         if not isinstance(index, self._QModelIndex) or not index.isValid():
             self.optionHoverCleared.emit()
@@ -607,27 +671,32 @@ class StateButton(QPushButton):
 
 
 class SegmentToggle(QWidget):
-    """Segmented toggle switch rendered as one unified control.
+    """分段切换控件：一个外框 + 两个互斥段（默认 HEX / ASCII）。
 
-    Used by the command library toolbar for the HEX / ASCII mode switch.
-    The outer widget (objectName = ``CmdLibModeSwitch``) draws a single
-    rounded frame; the inner segments are mutually exclusive ``QPushButton``
-    children.  Clicking a segment emits :attr:`modeChanged` with the
-    corresponding lower-case mode (``"hex"`` / ``"ascii"``).
+    * 视觉：未选中 = 默认按钮样式；选中 = 绿色高亮。
+    * 信号：只使用统一的 ``valueChanged(str)``（小写，"hex" / "ascii"）。
+      ``modeChanged(str)`` 作为旧代码的兼容别名同时发出，不建议新代码继续使用。
+    * 内部通过 ``QPushButton.clicked.connect(lambda _checked=False: _select_value(...))``
+      显式忽略 ``clicked(bool)`` 传入的布尔参数，避免把 True / False 当成字符串 mode。
     """
 
     modeChanged = Signal(str)
+    valueChanged = Signal(str)
 
     def __init__(
         self,
-        left_label: str = "HEX",
-        right_label: str = "ASCII",
+        left_text: str = "HEX",
+        right_text: str = "ASCII",
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.setObjectName("CmdLibModeSwitch")
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.setFixedHeight(CONTROL_HEIGHT)
+
+        self._left_value = str(left_text).strip().lower()
+        self._right_value = str(right_text).strip().lower()
+        self._value = self._left_value
 
         outer = QHBoxLayout(self)
         outer.setContentsMargins(2, 2, 2, 2)
@@ -636,55 +705,203 @@ class SegmentToggle(QWidget):
         self._group = QButtonGroup(self)
         self._group.setExclusive(True)
 
-        self._segments: dict[str, QPushButton] = {}
+        self.left_button = QPushButton(left_text, self)
+        self.left_button.setCheckable(True)
+        self.left_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.left_button.setMinimumWidth(48)
+        self._group.addButton(self.left_button)
 
-        left_btn = QPushButton(left_label, self)
-        left_btn.setCheckable(True)
-        left_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        left_btn.setMinimumWidth(48)
-        self._group.addButton(left_btn)
-        self._segments[left_label.lower()] = left_btn
-        outer.addWidget(left_btn)
+        self.right_button = QPushButton(right_text, self)
+        self.right_button.setCheckable(True)
+        self.right_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.right_button.setMinimumWidth(56)
+        self._group.addButton(self.right_button)
 
-        right_btn = QPushButton(right_label, self)
-        right_btn.setCheckable(True)
-        right_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        right_btn.setMinimumWidth(56)
-        self._group.addButton(right_btn)
-        self._segments[right_label.lower()] = right_btn
-        outer.addWidget(right_btn)
+        outer.addWidget(self.left_button)
+        outer.addWidget(self.right_button)
 
-        left_btn.clicked.connect(lambda _c=False, m=left_label.lower(): self._on_segment_clicked(m))
-        right_btn.clicked.connect(lambda _c=False, m=right_label.lower(): self._on_segment_clicked(m))
+        # —— 关键：显式忽略 clicked(bool) 传入的布尔参数，
+        #    永远用 _left_value / _right_value 这两个字符串，
+        #    避免 lambda 的默认值被 True/False 覆盖。
+        self.left_button.clicked.connect(
+            lambda _checked=False: self._select_value(self._left_value)
+        )
+        self.right_button.clicked.connect(
+            lambda _checked=False: self._select_value(self._right_value)
+        )
 
-    def _on_segment_clicked(self, mode: str) -> None:
-        self.set_mode(mode, block_external=False)
+        self.setValue(self._left_value, emit_signal=False)
 
-    def mode(self) -> str | None:
-        for key, btn in self._segments.items():
-            if btn.isChecked():
-                return key
-        return None
-
-    def set_mode(self, mode: str, *, block_external: bool = True) -> None:
-        key = str(mode).lower()
-        if key not in self._segments:
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+    def _select_value(self, value: str) -> None:
+        normalized = str(value or "").strip().lower()
+        if normalized not in {self._left_value, self._right_value}:
             return
-        for k, btn in self._segments.items():
-            was_checked = btn.isChecked()
-            if block_external:
-                with signals_blocked(btn):
-                    btn.setChecked(k == key)
-            else:
-                btn.setChecked(k == key)
-            if k == key and not was_checked:
-                self.modeChanged.emit(k)
+
+        changed = normalized != self._value
+        self._value = normalized
+        self._apply_checked_state()
+
+        if changed:
+            self.valueChanged.emit(normalized)
+            self.modeChanged.emit(normalized)
+
+    def _apply_checked_state(self) -> None:
+        left_selected = self._value == self._left_value
+
+        # QSignalBlocker：同步视觉状态时，不要再触发 left/right 各自的 clicked
+        left_blocker = QSignalBlocker(self.left_button)
+        right_blocker = QSignalBlocker(self.right_button)
+        try:
+            self.left_button.setChecked(left_selected)
+            self.right_button.setChecked(not left_selected)
+        finally:
+            # 显式 del 确保立即解除阻塞
+            del left_blocker
+            del right_blocker
+
+    # ------------------------------------------------------------------
+    # Public API（推荐直接使用 value/setValue；set_mode/mode 为兼容旧名）
+    # ------------------------------------------------------------------
+    def setValue(
+        self,
+        value: str,
+        *,
+        emit_signal: bool = False,
+    ) -> None:
+        normalized = str(value or "").strip().lower()
+        if normalized not in {self._left_value, self._right_value}:
+            return
+
+        changed = normalized != self._value
+        self._value = normalized
+        self._apply_checked_state()
+
+        if emit_signal and changed:
+            self.valueChanged.emit(normalized)
+            self.modeChanged.emit(normalized)
+
+    def value(self) -> str:
+        return self._value
+
+    # ---------- 兼容旧代码的别名 ----------
+    def set_mode(self, mode: str, *, block_external: bool = True) -> None:
+        self.setValue(mode, emit_signal=not block_external)
+
+    def mode(self) -> str:
+        return self.value()
 
     def hex_button(self) -> QPushButton:
-        return self._segments["hex"]
+        return self.left_button
 
     def ascii_button(self) -> QPushButton:
-        return self._segments["ascii"]
+        return self.right_button
+
+
+class ReorderableCycleTable(QTableWidget):
+    """QTableWidget 只负责拖动视觉与目标行计算；真正的顺序重排在外部 QTimer.singleShot(0) 后执行。
+
+    关键约束（必须严格遵守，否则 cellWidget + Qt InternalMove 会双移动导致 C++ 崩溃）：
+    * ``dropEvent`` 中绝对不能调用 ``super().dropEvent(event)``；
+    * ``dropEvent`` 中绝对不能执行 ``setRowCount / removeRow / insertRow / clearContents /
+      setCellWidget`` 或任何重建控件的操作；
+    * 只计算 ``(source_row, target_row)`` 两个整数，并用 ``QTimer.singleShot(0)`` 延后
+      发出 ``rowsReordered``。
+    """
+
+    rowsReordered = Signal(int, int)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+
+        self._drag_source_row = -1
+        self._drop_pending = False
+
+        self.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+
+        # 拖动由第一列☰或行空白区域发起；单击普通单元格不会立即误触编辑
+        self.setEditTriggers(
+            QAbstractItemView.EditTrigger.DoubleClicked
+            | QAbstractItemView.EditTrigger.EditKeyPressed
+        )
+        self.setDragEnabled(True)
+        self.setAcceptDrops(True)
+        self.viewport().setAcceptDrops(True)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.setDragDropOverwriteMode(False)
+        self.setDropIndicatorShown(True)
+
+    # ------------------------------------------------------------------
+    # Drag helpers
+    # ------------------------------------------------------------------
+    def startDrag(self, supported_actions):  # noqa: N802
+        source_row = self.currentRow()
+        if source_row < 0:
+            return
+        self._drag_source_row = int(source_row)
+        super().startDrag(supported_actions)
+
+    def dropEvent(self, event):  # noqa: N802
+        """仅计算目标位置，不修改任何表格结构；重建动作延后到 QTimer.singleShot(0)。"""
+        if self._drop_pending:
+            event.ignore()
+            return
+
+        source_row = int(self._drag_source_row)
+        total_rows = int(self.rowCount())
+
+        if not (0 <= source_row < total_rows):
+            event.ignore()
+            self._drag_source_row = -1
+            return
+
+        position = event.position().toPoint()
+        index = self.indexAt(position)
+        if index.isValid():
+            target_row = int(index.row())
+            target_rect = self.visualRect(index)
+            # 落在目标行下半部分：插入该行之后
+            if position.y() > target_rect.center().y():
+                target_row += 1
+        else:
+            # 拖到表格下方空白区：放到最后
+            target_row = total_rows
+
+        # 从前面拖到后面：pop 之后目标索引需要 -1
+        if source_row < target_row:
+            target_row -= 1
+        # 钳制到合法区间（0..total_rows-1）
+        target_row = max(0, min(target_row, total_rows - 1)) if total_rows else 0
+
+        if source_row == target_row:
+            event.ignore()
+            self._drag_source_row = -1
+            return
+
+        self._drop_pending = True
+        self._drag_source_row = -1
+
+        # 自己处理顺序，不再走 Qt 原生 InternalMove（避免与我们之后的重建双移动崩溃）
+        event.setDropAction(Qt.DropAction.MoveAction)
+        event.accept()
+
+        # 等 Qt 拖放事件栈完全 unwound 再对外触发重排 + 重建
+        QTimer.singleShot(
+            0,
+            lambda source=source_row, target=target_row: self._emit_deferred_reorder(
+                source, target
+            ),
+        )
+
+    def _emit_deferred_reorder(self, source_row: int, target_row: int) -> None:
+        try:
+            self.rowsReordered.emit(int(source_row), int(target_row))
+        finally:
+            self._drop_pending = False
 
 
 class HoverScrollController(QObject):
@@ -788,11 +1005,15 @@ class CommandLibraryTable(QTableWidget):
         self._data_edits: list[CellLineEdit] = []
         self._type_items: list[QTableWidgetItem] = []
         self._send_buttons: list[StateButton] = []
-        self._send_button_width = 78
+        # 统一按钮宽度，不随内容变化
+        self._send_button_width = CMDLIB_SEND_BUTTON_WIDTH
 
         self.setHorizontalHeaderLabels(["名称", "CMD类型", "指令数据", "操作"])
         self.verticalHeader().setVisible(False)
-        self.verticalHeader().setDefaultSectionSize(LIBRARY_ROW_HEIGHT)
+        # 统一固定行高（40px = 按钮高 32 + 上下 4px 内边距），禁止单行自适应
+        self.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
+        self.verticalHeader().setDefaultSectionSize(CMDLIB_ROW_HEIGHT)
+        self.verticalHeader().setMinimumSectionSize(CMDLIB_ROW_HEIGHT)
         self.horizontalHeader().setFixedHeight(LIBRARY_HEADER_HEIGHT)
 
         # 列宽策略保持稳定：滚动条常显槽位不变时不会改变列宽
@@ -804,7 +1025,11 @@ class CommandLibraryTable(QTableWidget):
         header.setSectionResizeMode(3, QHeaderView.Fixed)
         self.setColumnWidth(0, LIBRARY_NAME_WIDTH)
         self.setColumnWidth(1, LIBRARY_TYPE_WIDTH)
-        self.setColumnWidth(3, LIBRARY_ACTION_WIDTH)
+        # 操作列宽度 = 按钮宽(58) + 左右内边距各5 + 安全余量 8
+        self.setColumnWidth(
+            3,
+            CMDLIB_SEND_BUTTON_WIDTH + CMDLIB_ACTION_PAD_X * 2 + 8,
+        )
 
         # 滚动条常显：消除显/隐藏时导致列宽跳动
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
@@ -824,22 +1049,7 @@ class CommandLibraryTable(QTableWidget):
         self._build_rows()
         self.currentCellChanged.connect(self._on_current_cell_changed)
 
-    @staticmethod
-    def _command_row_height(send_button) -> int:
-        button_height = max(
-            send_button.minimumSizeHint().height(),
-            send_button.sizeHint().height(),
-            send_button.minimumHeight(),
-        )
-        return max(
-            CMDLIB_ROW_MIN_HEIGHT,
-            button_height + CMDLIB_ACTION_PAD_Y * 2,
-        )
-
     def _build_rows(self) -> None:
-        resolved_row_height: int | None = None
-        resolved_action_width: int | None = None
-
         for row in range(LIBRARY_MAX_ROWS):
             name_edit = CellLineEdit(row, self)
             name_edit.activated.connect(self.select_row)
@@ -859,13 +1069,18 @@ class CommandLibraryTable(QTableWidget):
             self.setCellWidget(row, 2, data_edit)
             self._data_edits.append(data_edit)
 
-            send_button = StateButton("发送", self, shadow=False)
-            send_button.setProperty("tableButton", True)
-            send_button.setFixedSize(58, 28)
+            # 使用与主发送按钮相同的公共类 StateButton，仅宽度收窄
+            send_button = StateButton("发送", self)
+            # 不再使用单独的 tableButton 样式角色，复用主按钮样式
+            # 统一尺寸：高度与主发送按钮完全一致（APP_BUTTON_HEIGHT）
+            send_button.setFixedHeight(APP_BUTTON_HEIGHT)
+            send_button.setFixedWidth(CMDLIB_SEND_BUTTON_WIDTH)
             send_button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-            send_button.clicked.connect(lambda _checked=False, index=row: self.sendRequested.emit(index))
+            send_button.clicked.connect(
+                lambda _checked=False, index=row: self.sendRequested.emit(index)
+            )
 
-            # 发送按钮装入居中容器：用主题统一留白，避免阴影/按钮被裁切
+            # 发送按钮装入居中容器：上下各 4px 内边距，按钮竖向完整显示
             action_container = QWidget(self)
             action_container.setObjectName("CommandActionCell")
             action_container.setSizePolicy(
@@ -884,28 +1099,9 @@ class CommandLibraryTable(QTableWidget):
             self.setCellWidget(row, 3, action_container)
             self._send_buttons.append(send_button)
 
-            send_button.ensurePolished()
-            current_row_height = self._command_row_height(send_button)
-            button_size = send_button.sizeHint()
-            current_action_width = max(
-                LIBRARY_ACTION_WIDTH,
-                button_size.width() + CMDLIB_ACTION_PAD_X * 2 + 4,
-            )
-            if resolved_row_height is None:
-                resolved_row_height = current_row_height
-                resolved_action_width = current_action_width
-
-        # 所有 40 行 + 垂直表头使用统一固定行高，禁止后续自动压缩裁切按钮
-        v_header = self.verticalHeader()
-        v_header.setDefaultSectionSize(resolved_row_height or CMDLIB_ROW_MIN_HEIGHT)
-        v_header.setMinimumSectionSize(resolved_row_height or CMDLIB_ROW_MIN_HEIGHT)
-        v_header.setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
-        if resolved_action_width is not None:
-            self.setColumnWidth(3, resolved_action_width)
-
     def set_items(self, items: Iterable[dict], mode: str) -> None:
         values = list(items)[:LIBRARY_MAX_ROWS]
-        self._mode = str(mode or "hex").lower()
+        self._mode = CommandLibraryStore.normalize_mode(mode)
         mode_text = self._mode.upper()
         self._real_count = len(values)
         self._updating = True
@@ -914,13 +1110,16 @@ class CommandLibraryTable(QTableWidget):
                 item = values[row] if row < len(values) else None
                 name = str(item.get("name", "")) if item else ""
                 payload = str(item.get("payload", item.get("data", ""))) if item else ""
-                cmd_type = str(item.get("type", mode_text)).upper() if item else mode_text
+
+                # 关键：type 永远由当前页面 mode 决定，不再信任旧数据里的 type 字段。
+                # 以前 ASCII 页面也会出现 HEX，就是这里写死或沿用了 item["type"]。
+                cmd_type = mode_text
 
                 with signals_blocked(self._name_edits[row]):
                     self._name_edits[row].setText(name)
                 with signals_blocked(self._data_edits[row]):
                     self._data_edits[row].setText(payload)
-                self._type_items[row].setText(cmd_type or mode_text)
+                self._type_items[row].setText(cmd_type)
                 self._send_buttons[row].setEnabled(bool(payload.strip()))
         finally:
             self._updating = False
@@ -970,70 +1169,102 @@ def set_button_width_for_texts(button, texts, extra_width: int = 28) -> None:
 class ZoomableDataView(QPlainTextEdit):
     """实时数据显示框。
 
-    * 默认使用 ``UI_FONT_FAMILY`` + ``RX_FONT_DEFAULT_SIZE``，与主界面一致；
+    * 默认复制全局 QApplication 字体（继承全局加粗），只覆盖字号和可选字体族；
+    * 默认字号 ``RX_FONT_DEFAULT_SIZE``（与主界面字号一致）；
     * ``Ctrl + 鼠标滚轮`` 调整字号（范围 RX_FONT_MIN~MAX）；
-    * 普通滚轮仍用于上下滚动。
+    * 普通滚轮仍用于上下滚动；
+    * 通过 ``displayStatsChanged`` 发出当前显示内容字节数与总行数统计。
     """
 
     fontSizeChanged = Signal(int)
+    displayStatsChanged = Signal(int, int)
 
     def __init__(
         self,
         parent=None,
         *,
-        font_family: str = UI_FONT_FAMILY,
-        font_size: int = RX_FONT_DEFAULT_SIZE,
-    ) -> None:
+        font_size=RX_FONT_DEFAULT_SIZE,
+    ):
         super().__init__(parent)
         self.setObjectName("ReceiveDataView")
 
-        self._font_family = str(font_family or UI_FONT_FAMILY)
-        self._font_size = self._clamp_font_size(font_size)
-        self._apply_data_font()
+        self._font_size = self._clamp_size(font_size)
+        self._apply_font()
+        # 80ms 内重复触发只统计一次
+        self._stats_timer: QTimer | None = None
 
     @staticmethod
-    def _clamp_font_size(value) -> int:
+    def _clamp_size(value) -> int:
         try:
             value = int(value)
         except (TypeError, ValueError):
             value = RX_FONT_DEFAULT_SIZE
-        return max(RX_FONT_MIN_SIZE, min(RX_FONT_MAX_SIZE, value))
+        return max(
+            RX_FONT_MIN_SIZE,
+            min(
+                RX_FONT_MAX_SIZE,
+                value,
+            ),
+        )
 
-    def _apply_data_font(self) -> None:
-        app = QApplication.instance()
-        font = QFont(app.font()) if app is not None else QFont()
-        if self._font_family:
-            font.setFamily(self._font_family)
-        font.setPointSize(max(1, int(self._font_size)))
+    def _apply_font(self):
+        # 复制全局字体，保留全局加粗设置
+        font = QFont(QApplication.font())
+        font.setPointSize(self._font_size)
         self.setFont(font)
         document = self.document()
         if document is not None:
             document.setDefaultFont(font)
         self.viewport().update()
 
-    def setDataFontSize(self, size) -> None:
-        size = self._clamp_font_size(size)
+    def setDataFontSize(self, size):
+        size = self._clamp_size(size)
         if size == self._font_size:
             return
         self._font_size = size
-        self._apply_data_font()
+        self._apply_font()
         self.fontSizeChanged.emit(size)
 
     def dataFontSize(self) -> int:
         return self._font_size
 
-    def wheelEvent(self, event: QWheelEvent) -> None:  # noqa: N802 - Qt API
-        modifiers = event.modifiers()
-        if modifiers & Qt.KeyboardModifier.ControlModifier:
+    # ------------------------------------------------------------
+    # 显示内容统计：字节数 + 总行数（防抖 80ms）
+    # ------------------------------------------------------------
+    def scheduleDisplayStatsUpdate(self) -> None:
+        """在插入/清空/裁剪/重渲染完成后调用，触发防抖统计。"""
+        if self._stats_timer is None:
+            self._stats_timer = QTimer(self)
+            self._stats_timer.setSingleShot(True)
+            self._stats_timer.timeout.connect(self._emit_display_stats)
+        self._stats_timer.start(80)
+
+    def _emit_display_stats(self) -> None:
+        document = self.document()
+        if document is None:
+            self.displayStatsChanged.emit(0, 0)
+            return
+        text = self.toPlainText()
+        # 按 UTF-8 计算字节数，占位提示文字会因空文本自动变成 0 行 0 字节
+        byte_count = len(text.encode("utf-8", errors="replace")) if text else 0
+        line_count = 0
+        if text:
+            line_count = int(document.blockCount())
+        self.displayStatsChanged.emit(int(byte_count), int(line_count))
+
+    def clear(self) -> None:
+        # 保持 QPlainTextEdit.clear 语义，同时安排一次统计归零
+        super().clear()
+        self.scheduleDisplayStatsUpdate()
+
+    def wheelEvent(self, event):
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
             delta = event.angleDelta().y()
             if delta > 0:
-                new_size = self._font_size + RX_FONT_STEP
+                self.setDataFontSize(self._font_size + RX_FONT_STEP)
             elif delta < 0:
-                new_size = self._font_size - RX_FONT_STEP
-            else:
-                event.accept()
-                return
-            self.setDataFontSize(new_size)
+                self.setDataFontSize(self._font_size - RX_FONT_STEP)
             event.accept()
             return
+        # 没按Ctrl时正常滚动数据
         super().wheelEvent(event)

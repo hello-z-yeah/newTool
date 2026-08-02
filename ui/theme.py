@@ -25,11 +25,20 @@ BLUE_HOVER = "#1677FF"
 GREEN = "#16A34A"
 RED = "#DC2626"
 
+# 状态栏状态点颜色：橙=未连接/未存储，绿=已监控/存储中
+STATUS_GREEN = GREEN
+STATUS_ORANGE = "#F59E0B"
+
 # ============================================================
 # 全局字体
 # ============================================================
 UI_FONT_FAMILY = "Microsoft YaHei UI"
-UI_FONT_POINT_SIZE = 9
+
+# 全局统一字号
+UI_FONT_POINT_SIZE = 10
+
+# 全局统一加粗
+UI_FONT_WEIGHT = 600
 
 # 实时数据框默认字号与主界面完全一致
 RX_FONT_DEFAULT_SIZE = UI_FONT_POINT_SIZE
@@ -69,6 +78,45 @@ CONTROL_GAP_X = 8
 CONTROL_HEIGHT = 32
 BUTTON_HEIGHT = 32
 
+# ============================================================
+# 指令库表格尺寸
+# ============================================================
+
+# 主发送按钮与指令库按钮共享高度
+APP_BUTTON_HEIGHT = BUTTON_HEIGHT
+
+# 指令库"发送"按钮仅缩小宽度，高度与主发送按钮一致
+CMDLIB_SEND_BUTTON_WIDTH = 58
+CMDLIB_SEND_BUTTON_HEIGHT = APP_BUTTON_HEIGHT
+
+# 操作单元格内边距
+CMDLIB_ACTION_PAD_X = 5
+CMDLIB_ACTION_PAD_Y = 4
+
+# 每一行固定高度
+CMDLIB_ROW_HEIGHT = (
+    CMDLIB_SEND_BUTTON_HEIGHT
+    + CMDLIB_ACTION_PAD_Y * 2
+)
+
+# 操作列总宽度
+LIBRARY_ACTION_WIDTH = (
+    CMDLIB_SEND_BUTTON_WIDTH
+    + CMDLIB_ACTION_PAD_X * 2
+    + 8
+)
+
+# 指令库整体规格：最大行数 / 表头高度 / 行高 / 网格颜色 / 列宽
+LIBRARY_MAX_ROWS = 40
+LIBRARY_HEADER_HEIGHT = 32
+LIBRARY_ROW_HEIGHT = CMDLIB_ROW_HEIGHT
+LIBRARY_GRID_COLOR = "#E6EAF0"
+LIBRARY_NAME_WIDTH = 125
+LIBRARY_TYPE_WIDTH = 90
+
+# 实时数据工具栏宽窄换行阈值（小于此宽度换两行）
+RECEIVE_TOOLBAR_WRAP_WIDTH = 1180
+
 # 带阴影按钮需要预留的安全空间
 BUTTON_SHADOW_PAD_X = 2
 BUTTON_SHADOW_PAD_Y = 2
@@ -93,18 +141,8 @@ CONFIG_EXPANDED_HEIGHT = CONTROL_ROW_MIN_HEIGHT * 2 + SECTION_ROW_GAP + SECTION_
 STATUS_HEIGHT = 38
 SEND_CARD_HEIGHT = 164
 
-LIBRARY_MAX_ROWS = 40
-LIBRARY_HEADER_HEIGHT = 32
-LIBRARY_ROW_HEIGHT = 27
-LIBRARY_GRID_COLOR = "#E6EAF0"
-LIBRARY_NAME_WIDTH = 125
-LIBRARY_TYPE_WIDTH = 90
-LIBRARY_ACTION_WIDTH = 78
-
-# 指令库发送按钮单元格留白与基础行高（统一40行共用）
-CMDLIB_ACTION_PAD_X = 5
-CMDLIB_ACTION_PAD_Y = 4
-CMDLIB_ROW_MIN_HEIGHT = 36
+# 兼容旧命名：其他代码仍有读取 CMDLIB_ROW_MIN_HEIGHT，保持 >= CMDLIB_ROW_HEIGHT
+CMDLIB_ROW_MIN_HEIGHT = CMDLIB_ROW_HEIGHT
 
 # ---------------------------------------------------------------------------
 # Unified combo-box constants & component-level QSS (applied at widget init)
